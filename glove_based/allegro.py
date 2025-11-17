@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025 WonikRobotics_official
-# Additional Contributions Copyright (c) 2025 Jungyeon Lee
+# Copyright (c) 2025 Wonik Robotics
 #
 # This software is licensed under the MIT License.
 # See the LICENSE file in the project root for full license text.
 
 """
-Simple ROS2 node that forwards external 16-D Float64MultiArray commands
+Simple ROS2 node that provides a publisher to send 16-D Float64MultiArray commands
 directly to the Allegro hand position controller.
 
 - Parameters:
   - controller_name (string): name of the controller (default: allegro_hand_position_controller)
-  - command_topic   (string): topic to subscribe for incoming commands (default: /finger_command)
-- Incoming message type: std_msgs/Float64MultiArray (expects 16 values)
 - Outgoing: published to /{controller_name}/commands (Float64MultiArray)
 """
 import rclpy
@@ -20,12 +17,6 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from controller_manager_msgs.srv import ListControllers, SwitchController
 import numpy as np
-
-# 25.11.05 Avery
-# This node is to forward the 16-D command to allegro hand controller
-# This is for using with teleoperation of both hands
-# This is for new allegro package which uses Float64MultiArray for command
-
 
 def activate_controller(node: Node, controller_to_activate: str) -> bool:
     """
@@ -126,26 +117,19 @@ class AllegroCommandForwarder(Node):
             # Single robot system: no suffix in controller name
             self.get_logger().info("Single robot mode: using controller without suffix")
             self.declare_parameter('controller_name', 'allegro_hand_position_controller')
-            self.declare_parameter('command_topic', '/finger_command')
-
         else:
-            # Two robots system: use _l/_r suffix
+            # Two robots system: use _l/_r suffix for controller
             if side == 'left':
                 self.declare_parameter('controller_name', 'allegro_hand_position_controller_l')
-                self.declare_parameter('command_topic', '/finger_command_l')
             else:
                 self.declare_parameter('controller_name', 'allegro_hand_position_controller_r')
-                self.declare_parameter('command_topic', '/finger_command_r')
 
         self.controller_name = self.get_parameter('controller_name').get_parameter_value().string_value
-        self.command_topic = self.get_parameter('command_topic').get_parameter_value().string_value
         self.target_topic = f'/{self.controller_name}/commands'
 
         # Try to activate controller
         if not activate_controller(self, self.controller_name):
-            self.get_logger().error(f"Failed to activate controller '{self.controller_name}'. Node will not forward commands.")
-            # Still continue to create subscription so user can retry or inspect logs,
-            # but publisher will remain None and publishes will be skipped.
+            self.get_logger().error(f"Failed to activate controller '{self.controller_name}'. Node will not publish commands.")
             self.publisher_ = None
         else:
             # Publisher to controller command topic
@@ -159,33 +143,8 @@ class AllegroCommandForwarder(Node):
             0.0, 0.0, 0.0, 0.0,   # Ring
         ])
 
-        # Subscriber: receive external commands and forward immediately
-        self.create_subscription(Float64MultiArray, self.command_topic, self.command_cb, 10)
-
         self.get_logger().info(f'AllegroCommandForwarder started.')
-        self.get_logger().info(f'Listening to command topic: {self.command_topic} (Float64MultiArray)')
-        self.get_logger().info(f'Forwarding to controller topic: {self.target_topic}')
-
-    def command_cb(self, msg: Float64MultiArray):
-        """
-        Receives external 16-D commands and forwards them to the controller.
-        If incoming message doesn't have exactly 16 elements, ignore and warn.
-        """
-        # Validate message length
-        data = list(msg.data) if msg and msg.data is not None else []
-        if len(data) != 16:
-            self.get_logger().warning(f"Ignoring incoming command: expected 16 elements but got {len(data)}.")
-            return
-
-        if not self.publisher_:
-            self.get_logger().error("No publisher available (controller not activated). Cannot forward command.")
-            return
-
-        # Forward message as-is
-        out = Float64MultiArray()
-        out.data = data
-        self.publisher_.publish(out)
-        self.get_logger().debug("Forwarded 16-D command to controller.")
+        self.get_logger().info(f'Publishing to controller topic: {self.target_topic}')
 
     def return_to_base(self):
         """Publish base (safe) position once (used at shutdown)."""
@@ -215,7 +174,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
-    # ros2 topic pub /finger_command_r std_msgs/Float64MultiArray "{data: [0.5,0.2,0.6,0.0, 0,0,0,0, 0,0,0,0, 0,0,0,0]}" -1
-
-

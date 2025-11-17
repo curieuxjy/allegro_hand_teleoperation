@@ -37,11 +37,8 @@ ROS2/
 │   ├── CMakeLists.txt
 │   ├── package.xml
 │   └── src
-│       ├── ClientLogging.hpp
-│       ├── ClientPlatformSpecific.cpp
-│       ├── ClientPlatformSpecific.hpp
-│       ├── ClientPlatformSpecificTypes.hpp
 │       ├── manus_data_publisher.cpp
+│       ├── ...
 │       ├── ManusDataPublisher.cpp
 │       └── ManusDataPublisher.hpp
 ├── manus_ros2_msgs
@@ -270,10 +267,318 @@ Learning-based approach using GeoRT (Geometric Retargeting) for improved accurac
 
 ### Workflow
 
-1. **Log Hand Data** - Record human hand poses from glove sensors
-2. **Gather Robot Data** - Collect corresponding robot configurations
-3. **Train Model** - Learn geometric mapping between human and robot hands
-4. **Inference in Simulation** - Test learned model in simulated environment
-5. **Deploy to Real Robot** - Transfer trained model to physical hardware
+1. **Setup Environment** - Create conda environment with required dependencies
+2. **Log Hand Data** - Record human hand poses from glove sensors
+3. **Generate Robot Data** - Collect robot kinematic configurations
+4. **Train Model** - Learn geometric mapping between human and robot hands
+5. **Inference & Deployment** - Test and deploy to simulation/hardware
 
-> **Note:** GeoRT implementation details coming soon.
+---
+
+### Step 0: Setup Conda Environment
+
+**System Requirements**
+
+- Ubuntu 22.04
+- ROS2 Humble
+- Allegro Hand V4
+- Sapien Simulator 2.2.2
+- Python 3.10+
+
+**Installation**
+
+```bash
+# Create conda environment
+conda create -n geort_test python=3.10
+
+# Activate environment
+conda activate geort_test
+
+# Install dependencies
+pip install -r glove_based/geort_requirements.txt
+
+# Install GeoRT package
+cd glove_based
+pip install -e .
+```
+
+---
+
+### Step 1: Log Human Hand Data
+
+Record human hand motions using the Manus glove for training the retargeting model.
+
+**1.1 Start Manus Data Publisher**
+
+```bash
+ros2 run manus_ros2 manus_data_publisher
+```
+
+**1.2 Preprocess Glove Data**
+
+Convert raw glove data to 21-joint skeleton format compatible with GeoRT:
+
+```bash
+conda activate geort_test
+python glove_based/manus_skeleton_21.py
+```
+
+**1.3 Log Human Data**
+
+Record hand motions with specified parameters:
+
+```bash
+# Right hand example
+python glove_based/geort_data_logger.py --name avery --handness right --duration 60 --hz 30
+
+# Left hand example
+python glove_based/geort_data_logger.py --name avery --handness left --duration 60 --hz 30
+```
+
+**Parameters:**
+- `--name`: Human identifier (default: `human1`)
+- `--handness`: Hand side (`left` or `right`, default: `right`)
+- `--duration`: Recording duration in seconds (default: 60)
+- `--hz`: Target frame rate (default: 30)
+
+**Output:** Data saved to `glove_based/data/{name}_{handness}_{timestamp}.npy`
+
+---
+
+### Step 2: Generate Robot Data
+
+Generate robot kinematics dataset for the Allegro hand configuration.
+
+> **Note:** Thanks to path fixes, commands work from any directory!
+
+**Quick Start**
+
+```bash
+conda activate geort_test
+
+# Generate and save dataset (default)
+python glove_based/geort/generate_robot_data.py --hand allegro_left
+
+# Visualize only (quick test, no dataset)
+python glove_based/geort/generate_robot_data.py --hand allegro_left -v
+
+# Preview mode (generate small dataset + visualize, no save)
+python glove_based/geort/generate_robot_data.py --hand allegro_left -n 100 --no-save
+```
+
+**Common Usage Patterns**
+
+| Command | Description | Generates | Saves | Visualizes |
+|---------|-------------|-----------|-------|------------|
+| `--hand allegro_left` | Standard generation | 1M samples | ✅ | ❌ |
+| `--hand allegro_left -v` | Visualization only | - | ❌ | ✅ 100 configs |
+| `--hand allegro_left -n 100 --no-save` | Preview mode | 100 samples | ❌ | ✅ 100 configs |
+| `--hand allegro_left -n 50000 -v --save` | Generate + visualize | 50K samples | ✅ | ✅ 100 configs |
+
+**Compact Command Options**
+
+```bash
+# Full example with all options
+python glove_based/geort/generate_robot_data.py \
+    --hand allegro_right \     # or -H (hand configuration)
+    -n 100000 \                # number of samples
+    -v \                       # enable visualization
+    --save \                   # save dataset (with -v)
+    -i 0.15                    # visualization interval (seconds)
+```
+
+**Parameters:**
+
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `--hand` | `-H` | Hand config (`allegro_left` or `allegro_right`) | `allegro_right` |
+| `--num-samples` | `-n` | Number of samples | 1M (generate) / 100 (viz) |
+| `--viz` | `-v` | Enable visualization | `False` |
+| `--save` | - | Save dataset (use with `-v`) | Auto |
+| `--no-save` | - | Don't save (implies `-v`) | `False` |
+| `--interval` | `-i` | Viz interval in seconds | `0.1` |
+
+**Visualization Features:**
+- Press **Ctrl+C** to stop early
+- Progress every 10 configurations
+- Smooth transitions between poses
+
+**Use Cases:**
+- ✅ Verify joint limits
+- ✅ Check for self-collisions
+- ✅ Understand workspace
+- ✅ Debug kinematics
+
+**Output:** `glove_based/data/allegro_{left|right}.npz`
+
+---
+
+### Step 3: Train GeoRT Model
+
+Train the geometric retargeting model using logged human data.
+
+**Basic Training**
+
+```bash
+# Right hand
+python glove_based/geort/trainer.py \
+    -hand allegro_right \
+    -human_data human1_right_1028_150817.npy
+
+# Left hand
+python glove_based/geort/trainer.py \
+    -hand allegro_left \
+    -human_data human1_left_1028_150409.npy
+```
+
+**Advanced Training**
+
+```bash
+python glove_based/geort/trainer.py \
+    -hand allegro_right \
+    -human_data avery_right_1117_105023.npy \
+    -ckpt_tag "experiment_v1" \
+    --w_chamfer 80.0 \
+    --w_curvature 0.1 \
+    --w_pinch 1.0 \
+    --wandb_project my_geort_project \
+    --wandb_entity my_username
+```
+
+**Training Parameters:**
+
+*Required:*
+- `-hand`: Robot hand config (`allegro_left` or `allegro_right`)
+- `-human_data`: Human data filename (in `glove_based/data/`)
+
+*Optional Loss Weights:*
+- `--w_chamfer`: Chamfer loss weight (default: 80.0)
+- `--w_curvature`: Curvature loss weight (default: 0.1)
+- `--w_collision`: Collision loss weight (default: 0.0)
+- `--w_pinch`: Pinch loss weight (default: 1.0)
+
+*Wandb Configuration:*
+- `--wandb_project`: Project name (default: `geort`)
+- `--wandb_entity`: Username/team (optional)
+- `--no_wandb`: Disable wandb logging
+- `-ckpt_tag`: Checkpoint tag (default: `''`)
+
+**Output:**
+- Checkpoints: `glove_based/checkpoint/allegro_{left|right}_{timestamp}_{tag}/`
+- Monitor: Wandb dashboard or terminal output
+
+---
+
+### Step 4: Inference & Deployment
+
+#### 4.1 Replay Evaluation (Recorded Data)
+
+Test trained model with pre-recorded human hand data in Sapien simulator.
+
+**Right Hand**
+
+```bash
+python glove_based/geort_replay_evaluation.py \
+    -ckpt_tag "human1_right_1028_150817_allegro_right_last" \
+    -hand allegro_right \
+    -data human1_right_1028_150817.npy
+```
+
+**Left Hand**
+
+```bash
+python glove_based/geort_replay_evaluation.py \
+    -ckpt_tag "human1_left_1028_150409_allegro_left_last" \
+    -hand allegro_left \
+    -data human1_left_1028_150409.npy
+```
+
+---
+
+#### 4.2 Real-time Simulation (Sapien)
+
+Test trained model with live glove input in Sapien simulator.
+
+**Setup**
+
+```bash
+# Terminal 1: Start Manus data publisher
+ros2 run manus_ros2 manus_data_publisher
+
+# Terminal 2: Preprocess glove data
+python glove_based/manus_skeleton_21.py
+```
+
+**Run Real-time Evaluation**
+
+```bash
+# Terminal 3: Right hand
+conda activate geort_test
+python glove_based/geort_realtime_evaluation.py \
+    -ckpt_tag "human1_right_1028_150817_allegro_right_last" \
+    -hand allegro_right
+
+# OR Left hand
+python glove_based/geort_realtime_evaluation.py \
+    -ckpt_tag "human1_left_1028_150409_allegro_left_last" \
+    -hand allegro_left
+```
+
+---
+
+#### 4.3 Real Hardware Deployment
+
+Deploy trained model to physical Allegro hands using the `GeortAllegroDeployer` ROS2 node.
+
+**Architecture Overview**
+
+The deployment pipeline consists of:
+1. **Manus Mocap Node**: Streams hand pose data from Manus gloves
+2. **Manus Skeleton Preprocessor**: Converts glove data to 21-joint skeleton format
+3. **GeoRT Deployer**: Runs trained models and publishes commands to robot controllers
+   - Loads trained IK models for left and right hands
+   - Subscribes to preprocessed hand poses
+   - Performs forward pass through GeoRT model
+   - Applies post-processing (reordering, optional calibration)
+   - Publishes joint commands to Allegro hand controllers
+
+**Setup**
+
+```bash
+# Terminal 1: Start Manus data publisher
+ros2 run manus_ros2 manus_data_publisher
+
+# Terminal 2: Preprocess glove data
+conda activate geort_test
+python glove_based/manus_skeleton_21.py
+
+# Terminal 3: Launch Allegro hand controller
+cd allegro_hand_ros2
+source install/setup.bash
+ros2 launch allegro_hand_bringup allegro_hand_duo.launch.py
+```
+
+**Run GeoRT Deployment**
+
+```bash
+# Terminal 4: Load Both Hand Checkpoints
+python glove_based/geort_allegro_deploy.py \
+      -right_ckpt "human1_right_1028_150817_allegro_right_last" \
+      -left_ckpt "human1_left_1028_150409_allegro_left_last"
+```
+
+**Post-Processing Notes**
+
+The `GeortAllegroDeployer` includes a `post_processing_commands()` function that:
+- **Step 1**: Reorders joints from model output (Index, Middle, Ring, Thumb) to hardware order (Thumb, Index, Middle, Ring)
+- **Step 2**: Applies optional per-joint calibration adjustments (currently disabled by default)
+
+> **Important**: The Step 2 calibration adjustments are hardware-specific tweaks that are **optional and not recommended** for general use. By default, these are commented out in the code. Only enable if you observe systematic errors in your specific robot setup.
+
+**Command Arguments**
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `-right_ckpt` | Checkpoint tag for right hand model | Yes |
+| `-left_ckpt` | Checkpoint tag for left hand model | Yes |
+| `--loop_hz` | Control loop frequency in Hz | No (default: 100.0) |

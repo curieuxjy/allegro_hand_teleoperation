@@ -1,0 +1,15 @@
+numpy==1.24.4
+pandas
+matplotlib
+torch
+torchvision
+torchaudio
+scipy
+sapien==2.2.2
+gym
+tqdm
+open3d
+trimesh
+rclpy
+loop_rate_limiters
+wandb

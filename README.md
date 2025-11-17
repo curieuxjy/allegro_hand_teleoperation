@@ -15,7 +15,7 @@ The core feature is **hand retargeting**, which converts glove-based or vision-b
 
 This project operates based on the official controller:
 
-### 👉 [Wonikrobotics-git/allegro_hand_ros2](https://github.com/Wonikrobotics-git/allegro_hand_ros2)
+### 👉 [Wonik Robotics-git/allegro_hand_ros2](https://github.com/Wonik Robotics-git/allegro_hand_ros2)
 
 Make sure to set up the Allegro Hand ROS2 controller before using this teleoperation code.
 
@@ -72,15 +72,11 @@ Reference: https://github.com/dexsuite/dex-retargeting
 
 ---
 
-## Referenced Research
+## 📑 Referenced Research
 
-- **GeoRT**
-  https://zhaohengyin.github.io/geort/
-  (CC-BY-NC / Code not included)
+- **GeoRT**: [https://zhaohengyin.github.io/geort/](https://zhaohengyin.github.io/geort/)
 
-- **DexSuite – Dex-Retargeting**
-  https://github.com/dexsuite/dex-retargeting
-  (Reference for concepts)
+- **DexSuite – Dex-Retargeting**: [https://github.com/dexsuite/dex-retargeting](https://github.com/dexsuite/dex-retargeting)
 
 ---
 
@@ -95,7 +91,7 @@ Reference: https://github.com/dexsuite/dex-retargeting
 
 MIT License
 
-- Modifications © 2025 **WonikRobotics_official**
+- Modifications © 2025 **Wonik Robotics**
 - Additional contributions © 2025 **Jungyeon Lee**
 
 See the full license in the [LICENSE](./LICENSE) file.

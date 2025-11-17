@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2025 WonikRobotics_official
+Copyright (c) 2025 Wonik Robotics
 Additional Contributions Copyright (c) 2025 Jungyeon Lee
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -41,8 +41,8 @@ plan to use or redistribute those components.
    Copyright (c) UC Berkeley and Meta Platforms, Inc.
    URL: https://haozhi.io/hora/
 
-   IMPORTANT: The GeoRT code and model weights are licensed under CC-BY-NC.  
-   This license prohibits commercial use.  
+   IMPORTANT: The GeoRT code and model weights are licensed under CC-BY-NC.
+   This license prohibits commercial use.
    No GeoRT source code is redistributed in this repository; only algorithmic
    concepts and API-level ideas were referenced.
 

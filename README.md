@@ -15,7 +15,7 @@ The core feature is **hand retargeting**, which converts glove-based or vision-b
 
 This project operates based on the official controller:
 
-### 👉 [Wonik Robotics-git/allegro_hand_ros2](https://github.com/Wonik Robotics-git/allegro_hand_ros2)
+### 👉 [WonikRobotics-git/allegro_hand_ros2](https://github.com/WonikRobotics-git/allegro_hand_ros2)
 
 Make sure to set up the Allegro Hand ROS2 controller before using this teleoperation code.
 
@@ -57,7 +57,8 @@ Simple heuristic mapping approach for joint transformation.
 
 #### 1-2. GeoRT-Inspired Retargeting
 AI-based mapping inspired by the GeoRT architecture.
-Reference: https://zhaohengyin.github.io/geort/
+
+> Reference: https://zhaohengyin.github.io/geort/
 
 📖 **For details, see:** [GLOVE_BASED.md](./GLOVE_BASED.md)
 
@@ -66,7 +67,8 @@ Reference: https://zhaohengyin.github.io/geort/
 ### 2. Vision-Based Teleoperation
 
 Camera-based hand pose estimation → retargeting to Allegro Hand.
-Reference: https://github.com/dexsuite/dex-retargeting
+
+> Reference: https://github.com/dexsuite/dex-retargeting
 
 📖 **For details, see:** [VISION_BASED.md](./VISION_BASED.md)
 

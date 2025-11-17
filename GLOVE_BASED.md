@@ -349,52 +349,21 @@ python glove_based/geort_data_logger.py --name human1 --handness left --duration
 
 Generate robot kinematics dataset for the Allegro hand configuration.
 
-
 ```bash
 conda activate geort
 
-# Generate and save dataset (default)
+# Standard: Generate 1M samples and save (recommended)
 python glove_based/geort/generate_robot_data.py --hand allegro_left
 
-# Visualize only (quick test, no dataset)
+# Optional: Visualize only (no dataset saved)
 python glove_based/geort/generate_robot_data.py --hand allegro_left --viz
-
-# Preview mode (generate small dataset + visualize, no save)
-python glove_based/geort/generate_robot_data.py --hand allegro_left --num-samples 100 --no-save
 ```
 
-**Common Usage Patterns**
-
-| Command | Description | Generates | Saves | Visualizes |
-|---------|-------------|-----------|-------|------------|
-| `--hand allegro_left` | Standard generation | 1M samples | ✅ | ❌ |
-| `--hand allegro_left --viz` | Visualization only | - | ❌ | ✅ 100 configs |
-| `--hand allegro_left --num-samples 100 --no-save` | Preview mode | 100 samples | ❌ | ✅ 100 configs |
-| `--hand allegro_left --num-samples 50000 --viz --save` | Generate + visualize | 50K samples | ✅ | ✅ 100 configs |
-
-**Compact Command Options**
-
-```bash
-# Full example with all options
-python glove_based/geort/generate_robot_data.py \
-    --hand allegro_right \        # hand configuration
-    --num-samples 100000 \        # number of samples
-    --viz \                       # enable visualization
-    --save \                      # save dataset (with --viz)
-    --interval 0.15               # visualization interval (seconds)
-```
-
-**Parameters:**
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--hand` | Hand config (`allegro_left` or `allegro_right`) | `allegro_right` |
-| `--num-samples` | Number of samples | 1M (generate) / 100 (viz) |
-| `--viz` | Enable visualization | `False` |
-| `--save` | Save dataset (use with `--viz`) | Auto |
-| `--no-save` | Don't save (implies `--viz`) | `False` |
-| `--interval` | Viz interval in seconds | `0.1` |
-
+**Key Parameters:**
+- `--hand`: Hand config (`allegro_left` or `allegro_right`)
+- `--num-samples`: Number of samples (default: 1M for generation, 100 for viz)
+- `--viz`: Enable visualization mode
+- `--no-save`: Preview mode (visualize without saving)
 
 **Output:** `glove_based/data/allegro_{left|right}.npz`
 
@@ -444,6 +413,9 @@ python glove_based/geort/trainer.py \
 - `--w_collision`: Collision loss weight (default: 0.0)
 - `--w_pinch`: Pinch loss weight (default: 1.0)
 
+*Data Scaling:*
+- `--scale`: Scale factor for human motion data (default: 1.0, no scaling)
+
 *Wandb Configuration:*
 - `--wandb_project`: Project name (default: `geort`)
 - `--wandb_entity`: Username/team (optional)
@@ -451,8 +423,29 @@ python glove_based/geort/trainer.py \
 - `--ckpt_tag`: Checkpoint tag (default: `''`)
 
 **Output:**
-- Checkpoints: `glove_based/checkpoint/allegro_{left|right}_{timestamp}_{tag}/`
-- Monitor: Wandb dashboard or terminal output
+- **Checkpoints**: `glove_based/checkpoint/allegro_{left|right}_{timestamp}_{tag}/`
+  - `best.pth` - Model with lowest training loss (automatically tracked, **recommended for deployment**)
+  - `last.pth` - Latest model from final epoch
+  - `epoch_{N}.pth` - Periodic snapshots (every 100 epochs)
+  - `config.json` - Training configuration including scale factor
+- **Chamfer Visualization**: `glove_based/data/chamfer_{human_name}_{robot_name}[_scale{scale}].html`
+  - Interactive 3D point cloud visualization for qualitative assessment
+  - Open in browser to inspect human-robot hand geometry alignment
+  - Use with quantitative metrics (loss values) for comprehensive evaluation
+- **Monitor**: Wandb dashboard or terminal output
+
+**Training Notes:**
+
+*Best Checkpoint Tracking:* Training automatically saves the model with lowest loss as `best.pth` (recommended). Console shows: `→ New best model saved! Loss: X.XXXXe-XX`. All evaluation/deployment scripts use `best.pth` by default; add `--use_last` flag to use `last.pth` instead.
+
+*Data Scaling (Optional):* Use `--scale` parameter to experiment with different scaling factors (e.g., 0.7, 0.8, 1.0, 1.2) for adapting to different hand sizes or glove calibrations. The scale value is saved in `config.json` and automatically loaded during inference/deployment for consistency. Original data files are never modified - scaling is applied on-the-fly.
+
+```bash
+# Example: Train with different scales and compare
+python glove_based/geort/trainer.py --hand allegro_right --human_data human1.npy --scale 0.7 --ckpt_tag "s07"
+python glove_based/geort/trainer.py --hand allegro_right --human_data human1.npy --scale 1.0 --ckpt_tag "s10"
+# Then evaluate to find the best scale for your setup
+```
 
 ---
 
@@ -462,11 +455,13 @@ python glove_based/geort/trainer.py \
 
 Test trained model with pre-recorded human hand data in Sapien simulator.
 
+> **Note:** The scale factor is automatically loaded from the checkpoint's `config.json` file, ensuring consistency with training. No manual scale specification needed.
+
 **Right Hand**
 
 ```bash
 python glove_based/geort_replay_evaluation.py \
-    --ckpt "human1_right_1028_150817_allegro_right_last" \
+    --ckpt "human1_right_1028_150817_allegro_right_s10" \
     --hand allegro_right \
     --data human1_right_1028_150817.npy
 ```
@@ -475,16 +470,24 @@ python glove_based/geort_replay_evaluation.py \
 
 ```bash
 python glove_based/geort_replay_evaluation.py \
-    --ckpt "human1_left_1028_150409_allegro_left_last" \
+    --ckpt "human1_left_1028_150409_allegro_left_s10" \
     --hand allegro_left \
     --data human1_left_1028_150409.npy
 ```
+
+**Parameters:**
+- `--ckpt`: Checkpoint tag for trained model
+- `--hand`: Hand configuration (`allegro_left` or `allegro_right`)
+- `--data`: Human data filename (in `glove_based/data/`)
+- `--use_last`: Load last checkpoint instead of best (optional, default: best)
 
 ---
 
 #### 4.2 Real-time Simulation (Sapien)
 
 Test trained model with live glove input in Sapien simulator.
+
+> **Note:** The scale factor is automatically loaded from the checkpoint's `config.json` file, ensuring consistency with training. No manual scale specification needed.
 
 **Setup**
 
@@ -502,14 +505,19 @@ python glove_based/manus_skeleton_21.py
 # Terminal 3: Right hand
 conda activate geort
 python glove_based/geort_realtime_evaluation.py \
-    --ckpt "human1_right_1028_150817_allegro_right_last" \
+    --ckpt "human1_right_1028_150817_allegro_right_s10" \
     --hand allegro_right
 
 # OR Left hand
 python glove_based/geort_realtime_evaluation.py \
-    --ckpt "human1_left_1028_150409_allegro_left_last" \
+    --ckpt "human1_left_1028_150409_allegro_left_s10" \
     --hand allegro_left
 ```
+
+**Parameters:**
+- `--ckpt`: Checkpoint tag for trained model
+- `--hand`: Hand configuration (`allegro_left` or `allegro_right`)
+- `--use_last`: Load last checkpoint instead of best (optional, default: best)
 
 ---
 
@@ -547,20 +555,22 @@ ros2 launch allegro_hand_bringup allegro_hand_duo.launch.py
 
 **Run GeoRT Deployment**
 
+> **Note:** The scale factor is automatically loaded from each checkpoint's `config.json` file, ensuring consistency with training. Each hand (left/right) uses its own model's scale.
+
 ```bash
 # Terminal 4: Load Both Hand Checkpoints
 python glove_based/geort_allegro_deploy.py \
-      --right_ckpt "human1_right_1028_150817_allegro_right_last" \
-      --left_ckpt "human1_left_1028_150409_allegro_left_last"
+      --right_ckpt "human1_right_1028_150817_allegro_right_s10" \
+      --left_ckpt "human1_left_1028_150409_allegro_left_s10"
 ```
 
 **Post-Processing Notes**
 
 The `GeortAllegroDeployer` includes a `post_processing_commands()` function that:
-- **Step 1**: Reorders joints from model output (Index, Middle, Ring, Thumb) to hardware order (Thumb, Index, Middle, Ring)
-- **Step 2**: Applies optional per-joint calibration adjustments (currently disabled by default)
+- **Step A**: Reorders joints from model output (Index, Middle, Ring, Thumb) to hardware order (Thumb, Index, Middle, Ring)
+- **Step B**: Applies optional per-joint calibration adjustments (currently disabled by default)
 
-> **Important**: The Step 2 calibration adjustments are hardware-specific tweaks that are **optional and not recommended** for general use. By default, these are commented out in the code. Only enable if you observe systematic errors in your specific robot setup.
+> **Important**: The Step B calibration adjustments are hardware-specific tweaks that are **optional and not recommended** for general use. By default, these are commented out in the code. Only enable if you observe systematic errors in your specific robot setup.
 
 **Command Arguments**
 
@@ -569,3 +579,4 @@ The `GeortAllegroDeployer` includes a `post_processing_commands()` function that
 | `--right_ckpt` | Checkpoint tag for right hand model | Yes |
 | `--left_ckpt` | Checkpoint tag for left hand model | Yes |
 | `--loop_hz` | Control loop frequency in Hz | No (default: 100.0) |
+| `--use_last` | Load last checkpoints instead of best | No (default: best) |

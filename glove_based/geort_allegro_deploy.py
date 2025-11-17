@@ -25,6 +25,10 @@ class GeortAllegroDeployer(Node):
         self.side = side
         self.allegro = AllegroCommandForwarder(side=side)
 
+        # Get scale from model's config (automatically loaded from checkpoint)
+        self.scale = model.scale
+        print(f"[{side.capitalize()} Deployer] Using scale from checkpoint: {self.scale}")
+
         # Parameters (declarable/tweakable)
         self.declare_parameter('smoothing_alpha', 0.9)   # EMA alpha: 0..1 (1 = no smoothing)
         self.declare_parameter('max_delta', 0.05)        # rad per tick max change (0 disables)
@@ -58,7 +62,7 @@ class GeortAllegroDeployer(Node):
         qpos = np.asarray(qpos).flatten()
 
         # ========================================================================
-        # Step 1: Reorder from model output to hardware order
+        # Step A: Reorder from model output to hardware order
         # ========================================================================
         # Model order: Index, Middle, Ring, Thumb
         # Hardware order: Thumb, Index, Middle, Ring
@@ -76,7 +80,7 @@ class GeortAllegroDeployer(Node):
         allegro_hw = allegro_hw.astype(float)
 
         # ========================================================================
-        # Step 2: Apply per-joint calibration adjustments (OPTIONAL - NOT RECOMMENDED)
+        # Step B: Apply per-joint calibration adjustments (OPTIONAL - NOT RECOMMENDED)
         # ========================================================================
         # WARNING: These adjustments are hardware-specific calibration tweaks.
         # In most cases, you should skip this step and use the model output directly.
@@ -115,6 +119,10 @@ class GeortAllegroDeployer(Node):
         points = data.get('result', None)
         if points is None:
             return
+
+        # Apply scaling to mocap data (automatically loaded from checkpoint config)
+        if self.scale != 1.0:
+            points = points * self.scale
 
         # forward through model (protect against model errors)
         try:
@@ -182,6 +190,8 @@ Example:
                         help="Checkpoint tag for left hand model")
     parser.add_argument('--loop_hz', type=float, default=100.0,
                         help="Control loop frequency in Hz (default: 100.0)")
+    parser.add_argument('--use_last', action='store_true',
+                        help='Load last checkpoints instead of best checkpoints (default: best)')
 
     args = parser.parse_args()
 
@@ -192,12 +202,13 @@ Example:
     left_mocap  = ManusMocap(node_name='manus_mocap_left',  topic_name='/manus_poses_left')
 
     # Load models from checkpoint tags
-    print(f"[Loading] Right hand model: {args.right_ckpt}")
-    right_model = load_model(args.right_ckpt)
-    print(f"[Loading] Left hand model: {args.left_ckpt}")
-    left_model = load_model(args.left_ckpt)
+    epoch_to_load = 0 if args.use_last else 'best'
+    print(f"[Loading] Right hand model: {args.right_ckpt} (checkpoint: {'last' if args.use_last else 'best'})")
+    right_model = load_model(args.right_ckpt, epoch=epoch_to_load)
+    print(f"[Loading] Left hand model: {args.left_ckpt} (checkpoint: {'last' if args.use_last else 'best'})")
+    left_model = load_model(args.left_ckpt, epoch=epoch_to_load)
 
-    # deployers with configurable loop_hz
+    # deployers with configurable loop_hz (scale automatically loaded from checkpoint)
     right_deployer = GeortAllegroDeployer("right", right_mocap, right_model, loop_hz=args.loop_hz)
     left_deployer  = GeortAllegroDeployer("left", left_mocap, left_model, loop_hz=args.loop_hz)
 

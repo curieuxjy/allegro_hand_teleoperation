@@ -296,6 +296,7 @@ class GeoRTTrainer:
             w_curvature (float): Weight for curvature smoothness loss
             w_collision (float): Weight for collision avoidance loss
             w_pinch (float): Weight for pinch detection loss
+            scale (float): Scale factor for human motion data (default: 1.0)
             analysis (bool): Enable loss analysis logging
             grad_log_step (int): Frequency for gradient metric computation
             compute_gradients (bool): Whether to compute per-term gradient norms
@@ -337,6 +338,9 @@ class GeoRTTrainer:
         w_collision = kwargs.get("w_collision", 0.0)
         w_pinch = kwargs.get("w_pinch", 1.0)
 
+        # Data scaling
+        scale_factor = kwargs.get("scale", 1.0)
+
         # Extract human name from data path
         human_name = human_data_path.stem
 
@@ -349,10 +353,8 @@ class GeoRTTrainer:
         save_dir = str(Path(get_checkpoint_root()) / f"{human_name}_{hand_model_name}_{time_stamp}")
         if exp_tag != '':
             save_dir += f'_{exp_tag}'
-        last_save_dir = str(Path(get_checkpoint_root()) / f"{human_name}_{hand_model_name}_last")
 
         os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(last_save_dir, exist_ok=True)
 
         # Save configuration
         joint_lower_limit, joint_upper_limit = self.hand.get_joint_limit()
@@ -374,6 +376,7 @@ class GeoRTTrainer:
             "W_CURVATURE": w_curvature,
             "W_COLLISION": w_collision,
             "W_PINCH": w_pinch,
+            "SCALE": scale_factor,
             "analysis": analysis,
             "compute_gradients": compute_gradients,
             "grad_log_step": grad_log_step,
@@ -382,7 +385,6 @@ class GeoRTTrainer:
         }
 
         save_json(export_config, Path(save_dir) / "config.json")
-        save_json(export_config, Path(last_save_dir) / "config.json")
 
         # ====================================================================
         # Dataset Preparation
@@ -403,13 +405,47 @@ class GeoRTTrainer:
         self.human_name = human_name  # Store for later use (e.g., visualization)
         human_points = np.array([human_points[:, idx, :3] for idx in human_finger_idxes])
 
+        # Apply scaling to human motion data
+        if scale_factor != 1.0:
+            print(f"Scaling human motion data by factor: {scale_factor}")
+            human_points = human_points * scale_factor
+
         point_dataset_human = MultiPointDataset.from_points(human_points, n=HUMAN_POINT_DATASET_N)
         point_dataloader = DataLoader(point_dataset_human, batch_size=POINT_BATCH_SIZE, shuffle=True)
+
+        # For reproducible chamfer visualization: prepare fixed data directly from source
+        if DRAW_CHAMFER:
+            # Use independent random generator with fixed seed (isolated from global state)
+            viz_rng = np.random.RandomState(42)
+
+            # Select fixed indices for chamfer visualization
+            # Use already scaled human_points (with training scale applied)
+            n_timesteps = human_points.shape[1]
+            viz_timestep_indices = viz_rng.choice(n_timesteps, size=POINT_BATCH_SIZE, replace=True)
+            viz_robot_indices = viz_rng.randint(0, robot_points.shape[1], 2048)
+
+            # Get fixed human points (with training scale already applied)
+            viz_human_points = torch.from_numpy(
+                human_points[:, viz_timestep_indices, :].transpose(1, 0, 2)
+            ).float().cuda()
+
+            # Get fixed robot points for visualization
+            viz_robot_points = torch.from_numpy(
+                robot_points[:, viz_robot_indices, :]
+            ).permute(1, 0, 2).float().cuda()
+
+            print(f"[Chamfer Viz] Fixed indices selected (scale: {scale_factor})")
+        else:
+            viz_human_points = None
+            viz_robot_points = None
 
         # Loss normalization stats
         loss_keys = ['direction', 'chamfer', 'curvature', 'pinch']
         loss_stats = {k: {"m": 0.0, "ms": 0.0, "initialized": False} for k in loss_keys} if normalize_losses else None
         eps = 1e-6
+
+        # Best checkpoint tracking
+        best_loss = float('inf')
 
         # ====================================================================
         # Training Loop
@@ -469,15 +505,9 @@ class GeoRTTrainer:
                 embedded_point_n = fk_model(ik_model(point_delta_1n))
                 curvature_loss = ((embedded_point_p + embedded_point_n - 2 * embedded_point) ** 2).mean()
 
-                # Chamfer Loss
+                # Chamfer Loss (training only - random sampling)
                 selected_idx = np.random.randint(0, robot_points.shape[1], 2048)
                 target = torch.from_numpy(robot_points[:, selected_idx, :]).permute(1, 0, 2).float().cuda()
-
-                if epoch == 0 and batch_idx == 0 and DRAW_CHAMFER:
-                    inp_orig_list = []
-                    tgt_orig_list = []
-                    dmat0_list = []
-                    nn_idx_list = []
 
                 chamfer_loss = torch.tensor(0.0, device=point.device)
                 for i in range(n_keypoints):
@@ -485,36 +515,6 @@ class GeoRTTrainer:
                         embedded_point[:, i, :].unsqueeze(0),
                         target[:, i, :].unsqueeze(0),
                     )
-
-                    if DRAW_CHAMFER and epoch == 0 and batch_idx == 0:
-                        fig_finger_name = self.get_keypoint_info()['finger_name']
-                        # print(f"FINGER IDX: {i} | FINGER NAME: {fig_finger_name[i]}")
-
-                        inp_orig = embedded_point[:, i, :].unsqueeze(0).detach().cpu()
-                        tgt_orig = target[:, i, :].unsqueeze(0).detach().cpu()
-                        inp_orig_list.append(inp_orig)
-                        tgt_orig_list.append(tgt_orig)
-
-                        input_points = embedded_point[:, i, :].unsqueeze(0).clone()
-                        target_points = target[:, i, :].unsqueeze(0).clone()
-
-                        input_points = input_points.unsqueeze(2)
-                        target_points = target_points.unsqueeze(1)
-
-                        _, N, _, _ = input_points.size()
-                        _, _, M, _ = target_points.size()
-                        input_points_repeat = input_points.repeat(1, 1, M, 1)
-                        target_points_repeat = target_points.repeat(1, N, 1, 1)
-
-                        dist_matrix = torch.sum((input_points_repeat - target_points_repeat)**2, dim=-1)
-                        dmat0 = dist_matrix[0].detach().cpu().numpy()
-                        nn_idx = dmat0.argmin(axis=1)
-                        dmat0_list.append(dmat0)
-                        nn_idx_list.append(nn_idx)
-
-                if DRAW_CHAMFER and epoch == 0 and batch_idx == 0:
-                    draw_chamfer_loss(inp_orig_list, tgt_orig_list, dmat0_list, nn_idx_list,
-                                    fig_finger_name, self.human_name, hand_model_name, self.RIGHT)
 
                 # Direction Loss
                 direction = F.normalize(torch.randn_like(point), dim=-1, p=2)
@@ -644,7 +644,60 @@ class GeoRTTrainer:
             if epoch % 100 == 0:
                 torch.save(ik_model.state_dict(), Path(save_dir) / f"epoch_{epoch}.pth")
                 torch.save(ik_model.state_dict(), Path(save_dir) / f"last.pth")
-                torch.save(ik_model.state_dict(), Path(last_save_dir) / f"last.pth")
+
+            # Save best checkpoint if current loss is lower
+            current_loss = train_log["total_loss"]
+            if current_loss < best_loss:
+                best_loss = current_loss
+                torch.save(ik_model.state_dict(), Path(save_dir) / f"best.pth")
+                print(f"  → New best model saved! Loss: {format_loss(best_loss)}")
+
+            # ================================================================
+            # Generate Chamfer Visualization (epoch 0 only, after training)
+            # ================================================================
+            if epoch == 0 and DRAW_CHAMFER:
+                print("\n[Generating Chamfer Visualization with Fixed Points]")
+
+                # Compute embedded points from fixed human points
+                viz_joint = ik_model(viz_human_points)
+                viz_embedded_point = fk_model(viz_joint)
+
+                # Prepare lists for visualization
+                inp_orig_list = []
+                tgt_orig_list = []
+                dmat0_list = []
+                nn_idx_list = []
+
+                # Compute chamfer data for each keypoint
+                for i in range(n_keypoints):
+                    inp_orig = viz_embedded_point[:, i, :].unsqueeze(0).detach().cpu()
+                    tgt_orig = viz_robot_points[:, i, :].unsqueeze(0).detach().cpu()
+                    inp_orig_list.append(inp_orig)
+                    tgt_orig_list.append(tgt_orig)
+
+                    # Compute distance matrix
+                    input_points = viz_embedded_point[:, i, :].unsqueeze(0).clone()
+                    target_points = viz_robot_points[:, i, :].unsqueeze(0).clone()
+
+                    input_points = input_points.unsqueeze(2)
+                    target_points = target_points.unsqueeze(1)
+
+                    _, N, _, _ = input_points.size()
+                    _, _, M, _ = target_points.size()
+                    input_points_repeat = input_points.repeat(1, 1, M, 1)
+                    target_points_repeat = target_points.repeat(1, N, 1, 1)
+
+                    dist_matrix = torch.sum((input_points_repeat - target_points_repeat)**2, dim=-1)
+                    dmat0 = dist_matrix[0].detach().cpu().numpy()
+                    nn_idx = dmat0.argmin(axis=1)
+                    dmat0_list.append(dmat0)
+                    nn_idx_list.append(nn_idx)
+
+                # Generate visualization
+                fig_finger_name = self.get_keypoint_info()['finger_name']
+                draw_chamfer_loss(inp_orig_list, tgt_orig_list, dmat0_list, nn_idx_list,
+                                fig_finger_name, self.human_name, hand_model_name, self.RIGHT, scale=scale_factor)
+                print("[Chamfer Visualization Complete]\n")
 
         return
 
@@ -675,7 +728,7 @@ if __name__ == '__main__':
     # Loss weights
     parser.add_argument('--w_chamfer', type=float, default=80.0,
                        help='Chamfer distance loss weight')
-    parser.add_argument('--w_curvature', type=float, default=0.1,
+    parser.add_argument('--w_curvature', type=float, default=0.15,
                        help='Curvature smoothness loss weight')
     parser.add_argument('--w_collision', type=float, default=0.0,
                        help='Collision avoidance loss weight')
@@ -690,6 +743,10 @@ if __name__ == '__main__':
     parser.add_argument('--no_wandb', action='store_true',
                        help='Disable wandb logging')
 
+    # Data scaling
+    parser.add_argument('--scale', type=float, default=1.0,
+                       help='Scale factor for human motion data (default: 1.0, no scaling)')
+
     args = parser.parse_args()
 
     # ------------------------------------------------------------------------
@@ -699,7 +756,7 @@ if __name__ == '__main__':
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
     FK_ITER = 200
-    IK_ITER = 2000
+    IK_ITER = 2500
     HUMAN_POINT_DATASET_N = 20000
     POINT_BATCH_SIZE = 4096
     W_CHAMFER = args.w_chamfer
@@ -753,6 +810,7 @@ if __name__ == '__main__':
         w_curvature=args.w_curvature,
         w_collision=args.w_collision,
         w_pinch=args.w_pinch,
+        scale=args.scale,
         # Analysis flags
         analysis=True,
         compute_gradients=False,

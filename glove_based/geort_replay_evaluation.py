@@ -8,11 +8,18 @@ def main():
     parser.add_argument('--hand', type=str, default='allegro')
     parser.add_argument('--ckpt', type=str)
     parser.add_argument('--data', type=str, default='human')
+    parser.add_argument('--use_last', action='store_true',
+                        help='Load last checkpoint instead of best checkpoint (default: best)')
 
     args = parser.parse_args()
 
     # GeoRT Model.
-    model = load_model(args.ckpt)
+    epoch_to_load = 0 if args.use_last else 'best'
+    model = load_model(args.ckpt, epoch=epoch_to_load)
+
+    # Get scale from model's config
+    scale = model.scale
+    print(f"[Replay Evaluation] Using scale from checkpoint: {scale}")
 
     # Motion Capture.
     mocap = ReplayMocap(args.data)
@@ -30,7 +37,13 @@ def main():
         result = mocap.get()
 
         if result['status'] == 'recording' and result["result"] is not None:
-            qpos = model.forward(result["result"])
+            points = result["result"]
+
+            # Apply scaling to mocap data (automatically loaded from checkpoint config)
+            if scale != 1.0:
+                points = points * scale
+
+            qpos = model.forward(points)
 
             hand.set_qpos_target(qpos)
 

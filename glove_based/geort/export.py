@@ -27,6 +27,10 @@ class GeoRTRetargetingModel:
         self.model.eval()
         self.qpos_normalizer = HandFormatter(joint_lower_limit, joint_upper_limit) # GeoRT will do normalization.
 
+        # Load scale from config (default to 1.0 if not found)
+        self.scale = config.get("hyperparams", {}).get("SCALE", 1.0)
+        print(f"[Model] Loaded scale from config: {self.scale}")
+
     def forward(self, keypoints):
         # keypoints: [N, 3]
         keypoints = keypoints[self.human_ids] # extract.
@@ -38,6 +42,13 @@ class GeoRTRetargetingModel:
 def load_model(tag='', epoch=0):
     '''
         Loading API.
+
+        Args:
+            tag: Checkpoint tag to search for
+            epoch: Epoch number to load, or special values:
+                   - 0 (default): load 'last.pth'
+                   - 'best': load 'best.pth'
+                   - positive int: load 'epoch_{epoch}.pth'
     '''
     checkpoint_root = get_checkpoint_root()
     all_checkpoints = os.listdir(checkpoint_root)
@@ -49,9 +60,13 @@ def load_model(tag='', epoch=0):
             break
 
     checkpoint_root = Path(checkpoint_root) / checkpoint_name
-    if epoch > 0:
+
+    # Handle different epoch specifications
+    if epoch == 'best' or epoch == -1:
+        model_path = checkpoint_root / f"best.pth"
+    elif isinstance(epoch, int) and epoch > 0:
         model_path = checkpoint_root / f"epoch_{epoch}.pth"
-    else: # == 0
+    else:  # epoch == 0 or default
         model_path = checkpoint_root / f"last.pth"
 
     config_path = checkpoint_root / "config.json"

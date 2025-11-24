@@ -553,10 +553,23 @@ The deployment pipeline consists of:
 - **α (smoothing_alpha)**: Controls responsiveness (0 = maximum smoothing, 1 = no smoothing)
 - **Rate Limiting**: Limits maximum joint angle change per control tick
 
-**Controller Management:**
-- **Automatic Activation**: Controllers are checked and activated automatically on startup
-- **Status Monitoring**: Verifies controller state via `controller_manager` services
-- **Safe Shutdown**: Returns hand to neutral position before node termination
+**Configure PD Gains:**
+
+Before launching the controller, configure the PD gains for optimal performance with this deployment. Edit the PD gains configuration file in your `allegro_hand_ros2` workspace:
+
+```yaml
+# File: allegro_hand_ros2/allegro_hand_hardwares/v4/description/config/pd_gains.yaml
+p_gains:
+  joint00: 1.5
+  ...
+  joint33: 1.5
+d_gain: 
+  joint00: 0.1024
+  ...
+  joint33: 0.1024
+```
+
+Reference configuration: [pd_gains.yaml](https://github.com/Wonikrobotics-git/allegro_hand_ros2/blob/main/allegro_hand_hardwares/v4/description/config/pd_gains.yaml)
 
 **Setup**
 

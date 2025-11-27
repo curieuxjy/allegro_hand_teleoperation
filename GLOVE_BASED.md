@@ -666,6 +666,36 @@ python glove_based/geort_allegro_deploy.py \
     --left_ckpt "human1_left_1028_150409_allegro_left_s10"
 ```
 
+```bash
+// 1
+
+python glove_based/geort_allegro_deploy.py \
+    --right_ckpt "miller_right_1120_101651_allegro_right_2025-11-20_11-04-40_s10" \
+    --left_ckpt "miller_left_1120_102542_allegro_left_2025-11-20_11-05-32_s10"
+
+
+// 2
+
+    python glove_based/geort_allegro_deploy.py \
+    --right_ckpt "miller_right_1120_104808_allegro_right_2025-11-20_12-00-43_s10" \
+    --left_ckpt "miller_left_1120_103637_allegro_left_2025-11-20_12-00-45_s10"
+
+
+//3
+
+python glove_based/geort_allegro_deploy.py \
+    --right_ckpt "miller_right_1120_104808_allegro_right_2025-11-20_12-29-03_s10" \
+    --left_ckpt "miller_left_1120_103637_allegro_left_2025-11-20_12-29-12_s10"
+
+
+// 4
+
+python glove_based/geort_allegro_deploy.py \
+    --right_ckpt "miller_right_1120_101651_allegro_right_2025-11-20_13-26-08_s10" \
+    --left_ckpt "miller_left_1120_102542_allegro_left_2025-11-20_13-26-00_s10"
+```
+
+
 **Advanced Usage:**
 
 ```bash

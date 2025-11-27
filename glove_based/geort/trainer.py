@@ -782,11 +782,11 @@ if __name__ == '__main__':
     # Loss weights
     parser.add_argument('--w_chamfer', type=float, default=80.0,
                        help='Chamfer distance loss weight')
-    parser.add_argument('--w_curvature', type=float, default=0.15,
+    parser.add_argument('--w_curvature', type=float, default=0.1, # 0.1
                        help='Curvature smoothness loss weight')
     parser.add_argument('--w_collision', type=float, default=0.0,
                        help='Collision avoidance loss weight')
-    parser.add_argument('--w_pinch', type=float, default=1.0,
+    parser.add_argument('--w_pinch', type=float, default=2.0,
                        help='Pinch detection loss weight')
 
     # Wandb configuration
@@ -820,9 +820,9 @@ if __name__ == '__main__':
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
     FK_ITER = 200
-    IK_ITER = 2500
+    IK_ITER = 2000
     HUMAN_POINT_DATASET_N = 20000
-    POINT_BATCH_SIZE = 4096
+    POINT_BATCH_SIZE = 2048
     W_CHAMFER = args.w_chamfer
     W_CURVATURE = args.w_curvature
     W_COLLISION = args.w_collision

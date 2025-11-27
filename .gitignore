@@ -212,3 +212,7 @@ checkpoint/
 *.npy
 *.ini
 *.html
+
+install/
+build/
+log/

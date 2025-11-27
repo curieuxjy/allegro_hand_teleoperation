@@ -55,6 +55,20 @@ class GeortAllegroDeployer(Node):
         timer_period = 1.0 / float(self.get_parameter('loop_hz').value)
         self.create_timer(timer_period, self._on_timer)
 
+        # Joint Limits
+        self.allegro_dof_lower = [
+            0.2630, -0.1050, -0.1890, -0.1620,   # Thumb
+            -0.4700, -0.1960, -0.1740, -0.2270,  # Index
+            -0.4700, -0.1960, -0.1740, -0.2270,  # Middle
+            -0.4700, -0.1960, -0.1740, -0.2270,  # Ring
+        ]
+        self.allegro_dof_upper = [
+            1.3960, 1.1630, 1.6440, 1.7190,      # Thumb
+            0.4700, 1.6100, 1.7090, 1.6180,      # Index
+            0.4700, 1.6100, 1.7090, 1.6180,      # Middle
+            0.4700, 1.6100, 1.7090, 1.6180,      # Ring
+        ]
+
     def post_processing_commands(self, qpos):
         """
         Post-process model output: reorder joints and apply calibration tweaks.
@@ -115,6 +129,11 @@ class GeortAllegroDeployer(Node):
 
         # # --- Ring adjustments ---
         # allegro_hw[15] = 0.0  # DIP: fixed position
+
+        # ========================================================================
+        # Step C: Clip to joint limits
+        # ========================================================================
+        allegro_hw = np.clip(allegro_hw, self.allegro_dof_lower, self.allegro_dof_upper)
 
         return allegro_hw
 

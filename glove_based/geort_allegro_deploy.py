@@ -118,7 +118,8 @@ class GeortAllegroDeployer(Node):
 
         # # --- Thumb adjustments ---
         allegro_hw[0] = allegro_hw[0] * 1.3 # + (20.0 * math.pi / 180.0)  # MCP_Spread: scale + offset
-        allegro_hw[1] = allegro_hw[1] * 1.3                              # MCP_Stretch: scale only
+        allegro_hw[1] = allegro_hw[1] * 1.2                              # MCP_Stretch: scale only
+        allegro_hw[2] = allegro_hw[2] * 0.9
         # allegro_hw[3] = allegro_hw[3] - (10.0 * math.pi / 180.0)        # DIP: offset
 
         # # --- Index adjustments ---

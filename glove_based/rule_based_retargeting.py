@@ -164,7 +164,7 @@ class ManusAllegroHeuristicDeployer(Node):
         # ========================================================================
         angle_deg = np.concatenate([
             # Thumb joints (4 DOF)
-            [90 - 1.75 * thumb_vals[1]],     # Thumb CMC joint
+            [90 - 2 * thumb_vals[1]],     # Thumb CMC joint
             [-45 + 3.0 * thumb_vals[0]],     # Thumb base joint 1
             [-30 + 3.0 * thumb_vals[2]],     # Thumb base joint 2
             [thumb_vals[3]],                 # Thumb tip joint
@@ -187,8 +187,9 @@ class ManusAllegroHeuristicDeployer(Node):
         # Step 4: Apply joint-specific scaling and offsets
         # ========================================================================
         # Thumb scaling
-        arr[0] *= 2.5                          # Joint 0: MCP Spread
+        arr[0] *= 1.5                          # Joint 0: MCP Spread
         arr[1] = arr[1] * 2 + np.deg2rad(90)   # Joint 1: PIP Stretch + 90° offset
+        arr[2] = arr[2] * 2 + np.deg2rad(45)
         arr[3] *= 2                            # Joint 3: DIP Stretch
 
         # Index finger scaling

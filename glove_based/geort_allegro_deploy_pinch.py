@@ -4,6 +4,14 @@
 # This software is licensed under the MIT License.
 # See the LICENSE file in the project root for full license text.
 
+"""
+GeoRT Allegro Deployer with Pinch Override
+
+This module deploys GeoRT models to Allegro hands with pinch gesture detection.
+When index_pinch_{left,right} topic is True, post_processing_commands() overrides
+thumb and index finger joints to predefined pinch positions (Step D).
+"""
+
 import time
 import math
 import argparse
@@ -11,7 +19,7 @@ import numpy as np
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Bool
 
 from manus_mocap import ManusMocap
 from allegro import AllegroCommandForwarder
@@ -51,6 +59,12 @@ class GeortAllegroDeployer(Node):
         self._last_cmd = None   # numpy array shape (16,)
         self._initialized = False
 
+        # Index pinch state (subscribe to index_pinch topic)
+        self._index_pinch = False
+        pinch_topic = f'/index_pinch_{side}'
+        self.create_subscription(Bool, pinch_topic, self._index_pinch_callback, 10)
+        print(f"[{side.capitalize()} Deployer] Subscribing to {pinch_topic}")
+
         # Timer
         timer_period = 1.0 / float(self.get_parameter('loop_hz').value)
         self.create_timer(timer_period, self._on_timer)
@@ -68,6 +82,10 @@ class GeortAllegroDeployer(Node):
             0.4700, 1.6100, 1.7090, 1.6180,      # Middle
             0.4700, 1.6100, 1.7090, 1.6180,      # Ring
         ]
+
+    def _index_pinch_callback(self, msg: Bool):
+        """Callback for index pinch detection topic."""
+        self._index_pinch = msg.data
 
     def post_processing_commands(self, qpos):
         """
@@ -135,6 +153,17 @@ class GeortAllegroDeployer(Node):
         # Step C: Clip to joint limits
         # ========================================================================
         allegro_hw = np.clip(allegro_hw, self.allegro_dof_lower, self.allegro_dof_upper)
+
+        # ========================================================================
+        # Step D: Override index finger commands when pinch detected
+        # ========================================================================
+        # When index_pinch is True (index 4 and 8 distance < threshold),
+        # force index finger joints (4-7) to zero
+        if self._index_pinch:
+            # thumb forcing
+            allegro_hw[0:4] = [0.9293, 0.74515, 0.72979, 1.07432]
+            # index forcing
+            allegro_hw[4:8] = [-0.2041, 0.74358, 1.5130, 0.4091]
 
         return allegro_hw
 
@@ -283,22 +312,21 @@ Example:
 if __name__ == '__main__':
     main()
 
-    
     # ```bash
     # // 1
-    # python glove_based/geort_allegro_deploy.py \
+    # python glove_based/geort_allegro_deploy_pinch.py \
     #     --right_ckpt "miller_right_1120_101651_allegro_right_2025-11-20_11-04-40_s10" \
     #     --left_ckpt "miller_left_1120_102542_allegro_left_2025-11-20_11-05-32_s10"
     # // 2
-    #     python glove_based/geort_allegro_deploy.py \
+    #     python glove_based/geort_allegro_deploy_pinch.py \
     #     --right_ckpt "miller_right_1120_104808_allegro_right_2025-11-20_12-00-43_s10" \
     #     --left_ckpt "miller_left_1120_103637_allegro_left_2025-11-20_12-00-45_s10"
     # //3
-    # python glove_based/geort_allegro_deploy.py \
+    # python glove_based/geort_allegro_deploy_pinch.py \
     #     --right_ckpt "miller_right_1120_104808_allegro_right_2025-11-20_12-29-03_s10" \
     #     --left_ckpt "miller_left_1120_103637_allegro_left_2025-11-20_12-29-12_s10"
     # // 4
-    # python glove_based/geort_allegro_deploy.py \
+    # python glove_based/geort_allegro_deploy_pinch.py \
     #     --right_ckpt "miller_right_1120_101651_allegro_right_2025-11-20_13-26-08_s10" \
     #     --left_ckpt "miller_left_1120_102542_allegro_left_2025-11-20_13-26-00_s10"
     # ```

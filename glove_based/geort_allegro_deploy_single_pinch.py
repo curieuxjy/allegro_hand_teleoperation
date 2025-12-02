@@ -4,13 +4,22 @@
 # This software is licensed under the MIT License.
 # See the LICENSE file in the project root for full license text.
 
+"""
+GeoRT Allegro Single Hand Deployer with Pinch Override
+
+Single hand deployment script that imports GeortAllegroDeployer from
+geort_allegro_deploy_pinch.py. Inherits pinch gesture detection behavior:
+when index_pinch_{left,right} topic is True, thumb and index finger joints
+are overridden to predefined pinch positions.
+"""
+
 import argparse
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 
 from manus_mocap import ManusMocap
 from geort import load_model
-from geort_allegro_deploy import GeortAllegroDeployer
+from geort_allegro_deploy_pinch import GeortAllegroDeployer # pinch post-processing
 
 def main():
     parser = argparse.ArgumentParser(

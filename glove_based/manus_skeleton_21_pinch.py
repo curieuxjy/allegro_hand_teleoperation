@@ -12,16 +12,20 @@ import open3d as o3d
 import rclpy
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
-from std_msgs.msg import Int32MultiArray, Float32MultiArray
+from std_msgs.msg import Int32MultiArray, Float32MultiArray, Bool
 from geometry_msgs.msg import PoseArray, Pose
 from manus_ros2_msgs.msg import ManusGlove
 from loop_rate_limiters import RateLimiter
+
+# Index pinch detection threshold (meters)
+INDEX_PINCH_THRESHOLD = 0.02
 
 #
 # Summary
 # Creates subscriptions only when /manus_glove_left or /manus_glove_right are visible from the node.
 # Removes subscriptions if topics disappear (resource saving).
 # Publishers (internal manus_poses_* etc.) are created once on first message arrival based on msg.side, as before.
+# Publishes index_pinch_{left,right} (Bool) when index fingertip (pose 4) and thumb tip (pose 8) distance < INDEX_PINCH_THRESHOLD.
 #
 
 
@@ -182,6 +186,10 @@ class ManusSkeleton21Node(Node):
         self.manus_id_left_pub       = None
         self.manus_pos_id_left_pub   = None
 
+        # Index pinch detection publishers (index 4 and 8 distance < 0.001m)
+        self.index_pinch_right_pub   = None
+        self.index_pinch_left_pub    = None
+
         # Lock to prevent publisher creation race condition
         self._pub_lock = threading.Lock()
 
@@ -204,12 +212,14 @@ class ManusSkeleton21Node(Node):
                     self.manus_poses_right_pub   = self.create_publisher(PoseArray, 'manus_poses_right', 10)
                     self.manus_id_right_pub      = self.create_publisher(Int32MultiArray, 'manus_node_ids_right', 10)
                     self.manus_pos_id_right_pub  = self.create_publisher(Float32MultiArray, 'manus_positions_with_id_right', 10)
+                    self.index_pinch_right_pub   = self.create_publisher(Bool, 'index_pinch_right', 10)
             elif side_norm == "Left":
                 if self.manus_poses_left_pub is None:
                     self.get_logger().info("Creating publishers for Left hand topics")
                     self.manus_poses_left_pub    = self.create_publisher(PoseArray, 'manus_poses_left', 10)
                     self.manus_id_left_pub       = self.create_publisher(Int32MultiArray, 'manus_node_ids_left', 10)
                     self.manus_pos_id_left_pub   = self.create_publisher(Float32MultiArray, 'manus_positions_with_id_left', 10)
+                    self.index_pinch_left_pub    = self.create_publisher(Bool, 'index_pinch_left', 10)
             else:
                 self.get_logger().warning(f"Unknown side in _ensure_publishers_for_side: '{side}'")
 
@@ -367,17 +377,31 @@ class ManusSkeleton21Node(Node):
         # Create publishers if not yet created (per side)
         self._ensure_publishers_for_side(msg.side)
 
+        # Compute index pinch detection (index 4 and 8 distance < 0.02m)
+        index_pinch = False
+        if len(pose_array.poses) > 8:
+            pos4 = np.array([pose_array.poses[4].position.x,
+                             pose_array.poses[4].position.y,
+                             pose_array.poses[4].position.z])
+            pos8 = np.array([pose_array.poses[8].position.x,
+                             pose_array.poses[8].position.y,
+                             pose_array.poses[8].position.z])
+            dist = np.linalg.norm(pos4 - pos8)
+            index_pinch = bool(dist < INDEX_PINCH_THRESHOLD)
+
         # publish (None check is a safety measure since we ensured)
         if msg.side == "Right":
             if self.manus_poses_right_pub is not None:
                 self.manus_poses_right_pub.publish(pose_array)
                 self.manus_id_right_pub.publish(Int32MultiArray(data=new_ids))
                 self.manus_pos_id_right_pub.publish(Float32MultiArray(data=pos_with_id))
+                self.index_pinch_right_pub.publish(Bool(data=index_pinch))
         elif msg.side == "Left":
             if self.manus_poses_left_pub is not None:
                 self.manus_poses_left_pub.publish(pose_array)
                 self.manus_id_left_pub.publish(Int32MultiArray(data=new_ids))
                 self.manus_pos_id_left_pub.publish(Float32MultiArray(data=pos_with_id))
+                self.index_pinch_left_pub.publish(Bool(data=index_pinch))
 
         self._update_lines(viz, msg.raw_nodes)
         self._update_axes(viz)

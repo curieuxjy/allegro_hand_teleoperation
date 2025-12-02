@@ -18,7 +18,7 @@ from manus_ros2_msgs.msg import ManusGlove
 from loop_rate_limiters import RateLimiter
 
 # Index pinch detection threshold (meters)
-INDEX_PINCH_THRESHOLD = 0.02
+INDEX_PINCH_THRESHOLD = 0.01
 
 #
 # Summary

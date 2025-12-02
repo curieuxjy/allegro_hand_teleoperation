@@ -161,9 +161,15 @@ class GeortAllegroDeployer(Node):
         # force index finger joints (4-7) to zero
         if self._index_pinch:
             # thumb forcing
-            allegro_hw[0:4] = [0.9293, 0.74515, 0.72979, 1.07432]
+            if self.side == "right":
+                allegro_hw[0:4] = [0.9293, 0.74515, 0.72979, 1.07432]
+            else:  # left
+                allegro_hw[0:4] = [0.9293, 0.74515, 0.72979, 1.07432]
             # index forcing
-            allegro_hw[4:8] = [-0.2041, 0.74358, 1.5130, 0.4091]
+            if self.side == "right":
+                allegro_hw[4:8] = [-0.2041, 0.74358, 1.5130, 0.4091]
+            else:  # left
+                allegro_hw[4:8] = [0.2041, 0.74358, 1.5130, 0.4091]
 
         return allegro_hw
 

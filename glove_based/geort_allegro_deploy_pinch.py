@@ -39,10 +39,6 @@ class GeortAllegroDeployer(Node):
         self.allegro = AllegroCommandForwarder(side=side, two_robots=two_robots)
         self.publisher_ = self.allegro.publisher_
 
-        # Get scale from model's config (automatically loaded from checkpoint)
-        self.scale = model.scale
-        print(f"[{side.capitalize()} Deployer] Using scale from checkpoint: {self.scale}")
-
         # Parameters (declarable/tweakable)
         self.declare_parameter('smoothing_alpha', float(smoothing_alpha))   # EMA alpha: 0..1 (1 = no smoothing)
         self.declare_parameter('max_delta', 0.05)        # rad per tick max change (0 disables)
@@ -183,10 +179,6 @@ class GeortAllegroDeployer(Node):
         if points is None:
             return
 
-        # Apply scaling to mocap data (automatically loaded from checkpoint config)
-        if self.scale != 1.0:
-            points = points * self.scale
-
         # forward through model (protect against model errors)
         try:
             qpos = self.model.forward(points)
@@ -282,7 +274,7 @@ Example:
     print(f"[Loading] Left hand model: {args.left_ckpt} (checkpoint: {'last' if args.use_last else 'best'})")
     left_model = load_model(args.left_ckpt, epoch=epoch_to_load)
 
-    # deployers with configurable parameters (scale automatically loaded from checkpoint)
+    # deployers with configurable parameters
     # two_robots=True: dual robot system (uses _l/_r suffix for controllers)
     right_deployer = GeortAllegroDeployer(
         "right", right_mocap, right_model,

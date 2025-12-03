@@ -313,7 +313,6 @@ class GeoRTTrainer:
             w_curvature (float): Weight for curvature smoothness loss
             w_collision (float): Weight for collision avoidance loss
             w_pinch (float): Weight for pinch detection loss
-            scale (float): Scale factor for human motion data (default: 1.0)
             analysis (bool): Enable loss analysis logging
             grad_log_step (int): Frequency for gradient metric computation
             compute_gradients (bool): Whether to compute per-term gradient norms
@@ -358,9 +357,6 @@ class GeoRTTrainer:
         w_collision = kwargs.get("w_collision", 0.0)
         w_pinch = kwargs.get("w_pinch", 1.0)
 
-        # Data scaling
-        scale_factor = kwargs.get("scale", 1.0)
-
         # Extract human name from data path
         human_name = human_data_path.stem
 
@@ -396,7 +392,6 @@ class GeoRTTrainer:
             "W_CURVATURE": w_curvature,
             "W_COLLISION": w_collision,
             "W_PINCH": w_pinch,
-            "SCALE": scale_factor,
             "SEED": kwargs.get("seed", None),
             "analysis": analysis,
             "compute_gradients": compute_gradients,
@@ -426,11 +421,6 @@ class GeoRTTrainer:
         self.human_name = human_name  # Store for later use (e.g., visualization)
         human_points = np.array([human_points[:, idx, :3] for idx in human_finger_idxes])
 
-        # Apply scaling to human motion data
-        if scale_factor != 1.0:
-            print(f"Scaling human motion data by factor: {scale_factor}")
-            human_points = human_points * scale_factor
-
         point_dataset_human = MultiPointDataset.from_points(human_points, n=HUMAN_POINT_DATASET_N)
         point_dataloader = DataLoader(point_dataset_human, batch_size=POINT_BATCH_SIZE, shuffle=True)
 
@@ -440,12 +430,11 @@ class GeoRTTrainer:
             viz_rng = np.random.RandomState(42)
 
             # Select fixed indices for chamfer visualization
-            # Use already scaled human_points (with training scale applied)
             n_timesteps = human_points.shape[1]
             viz_timestep_indices = viz_rng.choice(n_timesteps, size=POINT_BATCH_SIZE, replace=True)
             viz_robot_indices = viz_rng.randint(0, robot_points.shape[1], 2048)
 
-            # Get fixed human points (with training scale already applied)
+            # Get fixed human points
             viz_human_points = torch.from_numpy(
                 human_points[:, viz_timestep_indices, :].transpose(1, 0, 2)
             ).float().cuda()
@@ -455,7 +444,7 @@ class GeoRTTrainer:
                 robot_points[:, viz_robot_indices, :]
             ).permute(1, 0, 2).float().cuda()
 
-            print(f"[Chamfer Viz] Fixed indices selected (scale: {scale_factor})")
+            print("[Chamfer Viz] Fixed indices selected")
         else:
             viz_human_points = None
             viz_robot_points = None
@@ -729,7 +718,7 @@ class GeoRTTrainer:
                 # Generate visualization
                 fig_finger_name = self.get_keypoint_info()['finger_name']
                 draw_chamfer_loss(inp_orig_list, tgt_orig_list, dmat0_list, nn_idx_list,
-                                fig_finger_name, self.human_name, hand_model_name, self.RIGHT, scale=scale_factor)
+                                fig_finger_name, self.human_name, hand_model_name, self.RIGHT)
                 print("[Chamfer Visualization Complete]\n")
 
         # ====================================================================
@@ -796,10 +785,6 @@ if __name__ == '__main__':
     parser.add_argument('--no_wandb', action='store_true',
                        help='Disable wandb logging')
 
-    # Data scaling
-    parser.add_argument('--scale', type=float, default=1.0,
-                       help='Scale factor for human motion data (default: 1.0, no scaling)')
-
     # Random seed
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility (default: 42)')
@@ -850,7 +835,8 @@ if __name__ == '__main__':
         wandb_init_kwargs = {
             'project': args.wandb_project,
             'name': run_name,
-            'config': vars(args)
+            'config': vars(args),
+            'mode': 'online'  # 'online': sync to cloud, 'offline': save locally, 'disabled': no logging
         }
         if args.wandb_entity is not None:
             wandb_init_kwargs['entity'] = args.wandb_entity
@@ -873,7 +859,6 @@ if __name__ == '__main__':
         w_curvature=args.w_curvature,
         w_collision=args.w_collision,
         w_pinch=args.w_pinch,
-        scale=args.scale,
         seed=args.seed,
         # Analysis flags
         analysis=True,

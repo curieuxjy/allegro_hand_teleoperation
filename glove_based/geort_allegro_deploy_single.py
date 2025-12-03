@@ -58,7 +58,7 @@ Example:
     print(f"[Loading] {args.side.capitalize()} hand model: {args.ckpt} (checkpoint: {'last' if args.use_last else 'best'})")
     model = load_model(args.ckpt, epoch=epoch_to_load)
 
-    # deployer with configurable parameters (scale automatically loaded from checkpoint)
+    # deployer with configurable parameters
     # two_robots=False: single robot system (uses allegro_hand_position_controller without suffix)
     deployer = GeortAllegroDeployer(
         args.side, mocap, model,

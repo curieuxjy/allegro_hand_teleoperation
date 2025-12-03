@@ -107,11 +107,10 @@ glove_based/
 
 **GeortAllegroDeployer** (`geort_allegro_deploy.py`): Real-time deployment node that:
 1. Subscribes to `/manus_poses_{left,right}` for hand poses
-2. Applies scale factor from checkpoint config
-3. Runs IK model forward pass
-4. Post-processes: reorders joints (model order -> hardware order)
-5. Applies EMA smoothing and rate limiting
-6. Publishes to Allegro controllers
+2. Runs IK model forward pass
+3. Post-processes: reorders joints (model order -> hardware order)
+4. Applies EMA smoothing and rate limiting
+5. Publishes to Allegro controllers
 
 ### Data Flow
 
@@ -165,6 +164,6 @@ The `*_pinch.py` deployer variants subscribe to these topics and override thumb/
 
 ## Important Notes
 
+- Glove calibration should be performed on Windows using MANUS Core application, then `.mcal` files transferred to Linux
 - Glove topic names must be hardcoded in `ManusDataPublisher.cpp` (line 336) for left/right recognition
-- Scale factor from training is automatically loaded from checkpoint's `config.json`
 - EMA smoothing (default alpha=0.9) and rate limiting (default max_delta=0.05 rad/tick) are applied during deployment

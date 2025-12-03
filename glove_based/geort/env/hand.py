@@ -189,6 +189,12 @@ class HandKinematicModel:
         '''
         render = kwargs.get("render", False)
         urdf_path = config["urdf_path"]
+
+        # Convert relative path to absolute path based on glove_based directory
+        if urdf_path.startswith("./"):
+            glove_based_dir = Path(__file__).resolve().parent.parent.parent
+            urdf_path = str(glove_based_dir / urdf_path[2:])
+
         n_hand_dof = len(config["joint_order"])
         base_link = config["base_link"]
         joint_order = config["joint_order"]

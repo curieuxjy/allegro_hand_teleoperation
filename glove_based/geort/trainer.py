@@ -132,8 +132,7 @@ class GeoRTTrainer:
         """
         dataset_path = self.get_robot_kinematics_dataset_path(postfix=True)
         if not os.path.exists(dataset_path):
-            kinematics_dataset = self.generate_robot_kinematics_dataset(n_total=100000, save=True)
-            return kinematics_dataset
+            self.generate_robot_kinematics_dataset(n_total=100000, save=True)
 
         keypoint_names = self.get_keypoint_info()["link"]
         kinematics_dataset = RobotKinematicsDataset(dataset_path, keypoint_names=keypoint_names)

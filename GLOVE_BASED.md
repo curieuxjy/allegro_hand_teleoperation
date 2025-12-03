@@ -517,6 +517,7 @@ python glove_based/geort/trainer.py \
   - Interactive 3D point cloud visualization for qualitative assessment
   - Open in browser to inspect human-robot hand geometry alignment
   - Use with quantitative metrics (loss values) for comprehensive evaluation
+  - ![](./materials/chamfer_distance.png)
 - **Monitor**: Wandb dashboard or terminal output
 
 **Training Notes:**

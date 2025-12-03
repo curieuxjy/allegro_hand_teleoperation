@@ -12,10 +12,89 @@ This document covers two retargeting methods:
 
 > **Note:** This project uses Manus Core 3 SDK v3.0.0. Later versions should work with minor adjustments.
 
+> [!IMPORTANT]
+> **Calibration Recommendation:** For stability, we recommend performing glove calibration on Windows using the MANUS Core application (v3.0.1 or later) and saving the `.mcal` files. These calibration files can then be transferred to your Linux system for use with the ROS2 node. See [Glove Calibration](#glove-calibration) section below for details.
+
 ### Prerequisites
 
 - **MANUS Core 3 SDK** (with ROS2 Package): https://docs.manus-meta.com/3.0.0/Resources/
 - **Connection Guide**: https://docs.manus-meta.com/3.0.0/Plugins/SDK/ROS2/getting%20started/
+
+### Glove Calibration
+
+Calibration files (`.mcal`) store **skeleton scaling and sensor correction parameters** matched to the user's hand size:
+
+| Item | Without Calibration | With Calibration |
+|------|---------------------|------------------|
+| Finger length | SDK default values | Scaled to actual user hand size |
+| Joint angles | Based on raw sensor data | Corrected for individual ROM |
+| Fingertip position | May be inaccurate | Millimeter precision |
+| Hand pose reproducibility | Low | High |
+
+#### How Calibration is Applied in ROS2
+
+When the `manus_data_publisher` node runs, calibration files are loaded into the MANUS SDK, and **all published data is output in a calibrated state**.
+
+```
+MANUS Glove (Hardware)
+        ↓
+   Raw Sensor Data
+        ↓
+┌─────────────────────────────────────────────┐
+│  MANUS SDK (CoreSdk_SetGloveCalibration)    │
+│  ← humanLeftMetaglove.mcal loaded           │
+│  ← humanRightMetaglove.mcal loaded          │
+│  (calibration files exported from Windows)  │
+│                                             │
+│  Skeleton calculation with calibration      │
+└─────────────────────────────────────────────┘
+        ↓
+   Calibrated Data
+        ↓
+┌─────────────────────────────────────────────┐
+│  manus_data_publisher (ROS2 Node)           │
+│  → /manus_glove_left                        │
+│  → /manus_glove_right                       │
+└─────────────────────────────────────────────┘
+        ↓
+   ROS2 Topics (calibration-applied data)
+```
+
+#### Calibration Application in Code
+
+**1. Calibration file loading and SDK application** (`ManusDataPublisher.cpp:593-598`):
+```cpp
+SDKReturnCode t_Res = CoreSdk_SetGloveCalibration(
+    t_GloveId,
+    t_CalibData->data(),      // Binary data from .mcal file
+    static_cast<uint32_t>(t_CalibData->size()),
+    &t_Result
+);
+```
+
+**2. Receiving calibrated skeleton data** (`ManusDataPublisher.cpp:655`):
+```cpp
+// SDK internally returns data with calibration applied
+CoreSdk_GetRawSkeletonData(i, t_NxtClientRawSkeleton.nodes.data(), ...);
+```
+
+**3. Publishing as ROS2 messages** (`ManusDataPublisher.cpp:337-351`):
+```cpp
+// These position/orientation values have calibration applied
+t_Pose.position.x = t_Pos.x;
+t_Pose.position.y = t_Pos.y;
+t_Pose.position.z = t_Pos.z;
+t_Pose.orientation.x = t_Rot.x;
+// ...
+t_Msg.raw_nodes.push_back(t_Node);
+```
+
+#### ROS2 Message Fields with Calibration Applied
+
+The following fields in the `ManusGlove` message contain calibration-corrected values:
+- `raw_nodes[].pose.position` - Position of each finger joint (scaled to hand size via calibration)
+- `raw_nodes[].pose.orientation` - Rotation of each finger joint (joint angle corrected via calibration)
+- `ergonomics[].value` - Finger flexion/extension values (corrected to individual ROM via calibration)
 
 ### Verification
 

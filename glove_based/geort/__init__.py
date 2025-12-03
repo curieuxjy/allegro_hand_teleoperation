@@ -13,6 +13,7 @@ from geort.export import load_model
 
 def save_human_data(human_data, tag):
     save_path = get_human_data_output_path(tag)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(save_path, human_data)
     return save_path
 

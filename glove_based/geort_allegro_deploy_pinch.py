@@ -310,6 +310,12 @@ Example:
 if __name__ == '__main__':
     main()
 
+    # After Calibration:
+    # python glove_based/geort_allegro_deploy_pinch.py \
+    #     --right_ckpt "miller_right_1203_145107_allegro_right_2025-12-03_16-27-37_s10" \
+    #     --left_ckpt "miller_left_1203_150345_allegro_left_2025-12-03_16-13-42_s10"
+
+
     # ```bash
     # // 1
     # python glove_based/geort_allegro_deploy_pinch.py \

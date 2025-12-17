@@ -216,3 +216,5 @@ checkpoint/
 install/
 build/
 log/
+
+*.zip

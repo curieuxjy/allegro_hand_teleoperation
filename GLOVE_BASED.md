@@ -513,12 +513,13 @@ python glove_based/geort/trainer.py \
   - `last.pth` - Latest model from final epoch
   - `epoch_{N}.pth` - Periodic snapshots (every 100 epochs)
   - `config.json` - Training configuration
+- **Monitor**: Wandb dashboard or terminal output
 - **Chamfer Visualization**: `glove_based/data/chamfer_{human_name}_{robot_name}.html`
   - Interactive 3D point cloud visualization for qualitative assessment
   - Open in browser to inspect human-robot hand geometry alignment
   - Use with quantitative metrics (loss values) for comprehensive evaluation
 ![](./materials/chamfer_distance.png)
-- **Monitor**: Wandb dashboard or terminal output
+
 
 **Training Notes:**
 

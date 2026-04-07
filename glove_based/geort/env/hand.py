@@ -75,10 +75,10 @@ class HandKinematicModel:
         self.base_link_idx = self.hand.get_links().index(self.base_link)
 
         # Setup hand dofs.
-        self.all_joints = get_active_joints(self.hand, joint_names) # json 파일에 지정된 순서
+        self.all_joints = get_active_joints(self.hand, joint_names)  # order specified in json file
         all_limits = [joint.get_limits() for joint in self.all_joints]
 
-        self.joint_names = joint_names # json 파일에 지정된 순서
+        self.joint_names = joint_names  # order specified in json file
 
         self.user_idx_to_sim_idx = get_active_joint_indices(self.hand, joint_names)
         print("User-to-Sim Joint", self.user_idx_to_sim_idx)
@@ -93,7 +93,6 @@ class HandKinematicModel:
 
         init_qpos = self.convert_user_order_to_sim_order((self.joint_lower_limit + self.joint_upper_limit) / 2)
         self.hand.set_qpos(init_qpos)
-        # f8bd81712147aac0f37c6ce707ea99f4e979fbaf
         self.hand.set_qvel(0.0 * init_qpos)
         self.qpos_target = init_qpos
 
@@ -122,29 +121,11 @@ class HandKinematicModel:
             Setup keypoints to track.
         '''
 
-        # keypoint_link_names
-        # ['link_11.0_tip', 'link_7.0_tip', 'link_3.0_tip', 'link_15.0_tip']
-
         keypoint_links = [get_entity_by_name(self.hand.get_links(), link) for link in keypoint_link_names]
 
-        # [Actor(name="base_link", id="1"), Actor(name="palm", id="22"), Actor(name="wrist", id="23"),
-        # Actor(name="link_0.0", id="17"), Actor(name="link_1.0", id="18"), Actor(name="link_2.0", id="19"),
-        # Actor(name="link_3.0", id="20"), Actor(name="link_3.0_tip", id="21"),
-        # Actor(name="link_4.0", id="12"), Actor(name="link_5.0", id="13"), Actor(name="link_6.0", id="14"),
-        # Actor(name="link_7.0", id="15"), Actor(name="link_7.0_tip", id="16"),
-        # Actor(name="link_8.0", id="7"), Actor(name="link_9.0", id="8"), Actor(name="link_10.0", id="9"),
-        # Actor(name="link_11.0", id="10"), Actor(name="link_11.0_tip", id="11"),
-        # Actor(name="link_12.0", id="2"), Actor(name="link_13.0", id="3"), Actor(name="link_14.0", id="4"),
-        # Actor(name="link_15.0", id="5"), Actor(name="link_15.0_tip", id="6")]
-
-        # keypoint_links
-        # [Actor(name="link_11.0_tip", id="11"), Actor(name="link_7.0_tip", id="16"),
-        # Actor(name="link_3.0_tip", id="21"), Actor(name="link_15.0_tip", id="6")]
-
+        # i preserves finger order (index, middle, ring, thumb); link_name matches the urdf
         keypoint_links_id_dict = {link_name: (self.hand.get_links().index(keypoint_links[i]), i) \
                                   for i, link_name in enumerate(keypoint_link_names)}
-        # i로 순서 유지 (index, middle, ring, thumb)
-        # link_name으로 urdf와 매칭
 
         self.keypoint_links = keypoint_links
         self.keypoint_links_id_dict = keypoint_links_id_dict
@@ -167,7 +148,7 @@ class HandKinematicModel:
 
         for m, (link_idx, i) in self.keypoint_links_id_dict.items():
             pose = self.pmodel.get_link_pose(link_idx)
-            # offset 적용
+            # apply offset
             new_pose = sapien.Pose(
                 p=pose.p +
                 (pose.to_transformation_matrix()[:3, :3] @ self.keypoint_offsets[i].reshape(3, 1)).reshape(-1),
@@ -275,7 +256,5 @@ if __name__ == '__main__':
 
         steps += 1
         if steps % 30 == 0:
-            # f8bd81712147aac0f37c6ce707ea99f4e979fbaf
-            # targets = np.random.uniform(0, 0.3, 16)
             targets = np.random.uniform(0, 1, n_dof) * (dof_upper - dof_lower - 1e-7) + dof_lower + 1e-7
             model.set_qpos_target(targets)

@@ -193,8 +193,8 @@ Examples:
                         help="save dataset (use with --viz to visualize after saving)")
     parser.add_argument('--no-save', action='store_true',
                         help="don't save dataset (implies --viz for preview mode)")
-    parser.add_argument('--interval', type=float, default=0.1,
-                        help="visualization interval in seconds (default: 0.1)")
+    parser.add_argument('--interval', type=float, default=1.0,
+                        help="visualization interval in seconds (default: 1.0)")
     args = parser.parse_args()
 
     # Determine operation mode

@@ -1,0 +1,58 @@
+{
+    "README!!": "Five-finger v6 right hand config. fingertip link is the distal phalanx (_3 link); center_offset pushes the keypoint from joint origin to the actual fingertip along the link's principal axis. Verify center_offset placement with `python glove_based/geort/env/hand_debug.py --hand v6_right` (shows fingertip markers via HandViewerEnv).",
+
+    "name": "v6_right",
+    "urdf_path": "./assets/v6_right/v6_right.urdf",
+
+    "base_link": "virtual_base",
+
+    "joint_order": [
+        "joint_00", "joint_01", "joint_02", "joint_03",
+        "joint_10", "joint_11", "joint_12", "joint_13",
+        "joint_20", "joint_21", "joint_22", "joint_23",
+        "joint_30", "joint_31", "joint_32", "joint_33",
+        "joint_40", "joint_41", "joint_42", "joint_43"
+    ],
+
+    "fingertip_link": [
+        {
+            "name": "index",
+            "link": "index_3",
+            "joint": ["joint_10", "joint_11", "joint_12", "joint_13"],
+            "center_offset": [0.0, 0.0, 0.050],
+            "human_hand_id": 8
+        },
+
+        {
+            "name": "middle",
+            "link": "middle_3",
+            "joint": ["joint_20", "joint_21", "joint_22", "joint_23"],
+            "center_offset": [0.0, 0.0, 0.050],
+            "human_hand_id": 12
+        },
+
+        {
+            "name": "ring",
+            "link": "ring_3",
+            "joint": ["joint_30", "joint_31", "joint_32", "joint_33"],
+            "center_offset": [0.0, 0.0, 0.050],
+            "human_hand_id": 16
+        },
+
+        {
+            "name": "pinky",
+            "link": "pinky_3",
+            "joint": ["joint_40", "joint_41", "joint_42", "joint_43"],
+            "center_offset": [0.050, 0.0, 0.0],
+            "human_hand_id": 20
+        },
+
+        {
+            "name": "thumb",
+            "link": "thumb_3",
+            "joint": ["joint_00", "joint_01", "joint_02", "joint_03"],
+            "center_offset": [0.050, 0.0, 0.0],
+            "human_hand_id": 4
+        }
+    ]
+}

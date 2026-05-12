@@ -5,12 +5,23 @@
 # See the LICENSE file in the project root for full license text.
 
 """
-Hand kinematic model and viewer environment for Allegro Hand visualization.
+Hand kinematic model and viewer environment for hand visualization & debug.
 
 Provides:
-- HandKinematicModel: Kinematic model with forward kinematics and keypoint computation
-- HandViewerEnv: Multi-hand visualization environment with fingertip markers
+- HandKinematicModel: kinematic model with FK + keypoint (fingertip) computation
+- HandViewerEnv: multi-hand visualization with:
+    * fingertip sphere markers (one per keypoint, at `link.world * center_offset`)
+    * base-frame RGB axis markers (X=red, Y=green, Z=blue) anchored at the
+      config's `base_link` entity — useful for verifying the GeoRT-template
+      coordinate convention is matched across hands
 - Collision filtering utilities for multi-hand scenes
+
+CLI flags (entry point at bottom):
+- `--hand <name> [<name> ...]` : load arbitrary config(s) (e.g., v6_right,
+  allegro_right). Overrides legacy `--render-hand left|right|both`.
+- `--kinematic` : snap qpos directly instead of PD-driving via physics. Use
+  this for coordinate / offset verification — physics + self-collision can
+  cause large hands (e.g., v6_right with 5 fingers) to flail wildly.
 """
 
 import numpy as np
@@ -201,8 +212,14 @@ class HandKinematicModel:
     @staticmethod
     def build_from_config(config, **kwargs):
         """Now accepts shared scene via kwargs['scene'] (optional)."""
+        from pathlib import Path
         render = kwargs.get("render", False)
         urdf_path = config["urdf_path"]
+        # Resolve "./xxx" against the glove_based/ directory (this file lives at
+        # glove_based/geort/env/hand_debug.py), matching hand.py's behavior.
+        if urdf_path.startswith("./"):
+            glove_based_dir = Path(__file__).resolve().parent.parent.parent
+            urdf_path = str(glove_based_dir / urdf_path[2:])
         n_hand_dof = len(config["joint_order"])
         base_link = config["base_link"]
         joint_order = config["joint_order"]
@@ -264,6 +281,10 @@ class HandViewerEnv:
         self.tip_spheres = []  # list of list: tip_spheres[m_idx] -> [actors...]
         self._create_tip_spheres()
 
+        # per-model base-frame axis markers (X=red, Y=green, Z=blue)
+        self.axis_markers = []  # one actor per model
+        self._create_axis_markers()
+
     def _create_tip_spheres(self):
         """Create visual-only spheres for each model's keypoints (one-time)."""
         if len(self.tip_spheres) > 0:
@@ -293,8 +314,59 @@ class HandViewerEnv:
                 per_model_spheres.append(sphere)
             self.tip_spheres.append(per_model_spheres)
 
+    def _create_axis_markers(self, length=0.06, thickness=0.003):
+        """Create one RGB axis-triad marker per model:
+            X axis -> red box extending in +X
+            Y axis -> green box extending in +Y
+            Z axis -> blue box extending in +Z
+        Each triad is anchored to the model's base_link entity (= the link
+        named in the config's `base_link` field). This lets you visually
+        confirm that two hands share the same coordinate convention (GeoRT
+        template: X=palm normal, Y=palm->thumb, Z=palm->middle finger)."""
+        if len(self.axis_markers) > 0:
+            return
+        for model in self.models:
+            builder = self.scene.create_actor_builder()
+            # X arrow (red): box extending in +X
+            builder.add_box_visual(
+                pose=sapien.Pose(p=[length / 2, 0, 0]),
+                half_size=[length / 2, thickness, thickness],
+                color=[1.0, 0.0, 0.0],
+            )
+            # Y arrow (green): box extending in +Y
+            builder.add_box_visual(
+                pose=sapien.Pose(p=[0, length / 2, 0]),
+                half_size=[thickness, length / 2, thickness],
+                color=[0.0, 1.0, 0.0],
+            )
+            # Z arrow (blue): box extending in +Z
+            builder.add_box_visual(
+                pose=sapien.Pose(p=[0, 0, length / 2]),
+                half_size=[thickness, thickness, length / 2],
+                color=[0.0, 0.0, 1.0],
+            )
+            self.axis_markers.append(builder.build_static(name="axis_marker"))
+
+    def _update_axis_markers(self):
+        """Each frame: snap each marker to its model's base_link world pose."""
+        for mi, model in enumerate(self.models):
+            if mi >= len(self.axis_markers):
+                continue
+            # model.base_link is the link entity matching config["base_link"]
+            # (resolved in HandKinematicModel.__init__).
+            self.axis_markers[mi].set_pose(model.base_link.get_pose())
+
     def _update_tip_positions(self):
-        """Each frame: move each model's spheres to its current keypoint positions."""
+        """Each frame: place each model's fingertip spheres at the WORLD-frame
+        position `link.world_pose * center_offset` — the exact point GeoRT
+        treats as the keypoint target during training.
+
+        NOTE: we do NOT use `keypoint_from_qpos`, which returns coordinates in
+        the base_link LOCAL frame; feeding those into `set_pose` (world frame)
+        would put markers offset from the hand by the root_pose translation.
+        Reading `link.get_pose()` directly gives the world pose that already
+        accounts for the articulation root_pose + chain FK.
+        """
         for mi, model in enumerate(self.models):
             if not hasattr(model, "keypoint_links"):
                 continue
@@ -304,16 +376,17 @@ class HandViewerEnv:
                 if mi >= len(self.tip_spheres) or len(self.tip_spheres[mi]) == 0:
                     continue
 
-            qpos_sim = model.hand.get_qpos()
-            qpos_user = model.convert_sim_order_to_user_order(qpos_sim)
-            keypoints = model.keypoint_from_qpos(qpos_user, ret_vec=True)  # (N, 3)
-
-            for i, p in enumerate(keypoints):
-                self.tip_spheres[mi][i].set_pose(sapien.Pose(p=p))
+            for i, (link, offset) in enumerate(zip(model.keypoint_links,
+                                                   model.keypoint_offsets)):
+                lp = link.get_pose()
+                R = lp.to_transformation_matrix()[:3, :3]
+                tip_world = lp.p + R @ np.asarray(offset)
+                self.tip_spheres[mi][i].set_pose(sapien.Pose(p=tip_world))
 
     def update(self):
         self.scene.step()
         self._update_tip_positions()
+        self._update_axis_markers()
         self.scene.update_render()
         self.viewer.render()
 
@@ -321,14 +394,44 @@ class HandViewerEnv:
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description="Visualize Allegro hands")
-    parser.add_argument(
+    parser = argparse.ArgumentParser(description="Visualize hand(s) with fingertip markers")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--render-hand",
         choices=["left", "right", "both"],
         default="both",
-        help="Which hand(s) to visualize in the viewer.",
+        help="Allegro hand(s) to visualize (legacy default). Ignored if --hand is given.",
+    )
+    group.add_argument(
+        "--hand", nargs="+",
+        help="Config name(s) to load (e.g., 'v6_right', 'allegro_right v6_right'). "
+             "Overrides --render-hand.",
+    )
+    parser.add_argument(
+        "--kinematic", action="store_true",
+        help="Snap qpos directly without physics — avoids PD/self-collision wobble. "
+             "Recommended for coordinate-frame and fingertip-offset verification: "
+             "hands with many DOFs and tight finger packing (e.g., v6_right's 5 "
+             "fingers / 20 DOFs) thrash under PD + self-collision otherwise.",
+    )
+    parser.add_argument(
+        "--pose", choices=["random", "zero", "mid"], default="random",
+        help="Static pose mode (default: random cycles every 30 steps). "
+             "'zero' = all joint angles = 0 (fully extended fingers; best for "
+             "checking fingertip offsets). 'mid' = midpoint of each joint's "
+             "limits.",
     )
     args = parser.parse_args()
+
+    # Resolve which configs to load.
+    if args.hand:
+        config_names = list(args.hand)
+    else:
+        config_names = []
+        if args.render_hand in ("left", "both"):
+            config_names.append("allegro_left")
+        if args.render_hand in ("right", "both"):
+            config_names.append("allegro_right")
 
     # 1) Shared engine/renderer/scene
     engine = sapien.Engine()
@@ -345,66 +448,95 @@ if __name__ == '__main__':
     scene_cfg.solver_velocity_iterations = 1
     shared_scene = engine.create_scene(scene_cfg)
 
-    # 2) Load configs (we might use only one of them)
-    left_config = get_config("allegro_left")
-    right_config = get_config("allegro_right")
+    # 2) Load configs, build models, initialize keypoints — all generic in a single loop
+    configs = [get_config(name) for name in config_names]
+    print(f"[hand_debug] loading {len(configs)} hand(s): {[c['name'] for c in configs]}")
 
-    # 3) Conditionally build models into the SAME scene
     models = []
-    left_model = right_model = None
+    for cfg in configs:
+        m = HandKinematicModel.build_from_config(cfg, scene=shared_scene, render=False)
+        m.hand.set_root_pose(sapien.Pose([0.0, 0.0, 0.35], [0.695, 0.0, -0.718, 0.0]))
+        models.append(m)
 
-    if args.render_hand in ("left", "both"):
-        left_model = HandKinematicModel.build_from_config(left_config, scene=shared_scene, render=False)
-        left_model.hand.set_root_pose(sapien.Pose([0.0, 0.0, 0.35], [0.695, 0.0, -0.718, 0.0]))
-        models.append(left_model)
+    # If exactly two hands, filter collisions between them (keeps the original
+    # left/right behavior; harmless for other 2-config combinations).
+    if len(models) == 2:
+        GROUP_A = 1 << 0
+        GROUP_B = 1 << 1
+        set_articulation_collision_group(models[0].hand, GROUP_A, ignore_bits=GROUP_B)
+        set_articulation_collision_group(models[1].hand, GROUP_B, ignore_bits=GROUP_A)
 
-    if args.render_hand in ("right", "both"):
-        right_model = HandKinematicModel.build_from_config(right_config, scene=shared_scene, render=False)
-        right_model.hand.set_root_pose(sapien.Pose([0.0, 0.0, 0.35], [0.695, 0.0, -0.718, 0.0]))
-        models.append(right_model)
+    for m, cfg in zip(models, configs):
+        links = [info["link"] for info in cfg["fingertip_link"]]
+        offsets = [info["center_offset"] for info in cfg["fingertip_link"]]
+        m.initialize_keypoint(links, offsets)
 
-    # 3.5) If both hands exist, filter collisions only between them
-    if left_model is not None and right_model is not None:
-        LEFT_GROUP  = 1 << 0  # 0b0001
-        RIGHT_GROUP = 1 << 1  # 0b0010
-        set_articulation_collision_group(left_model.hand,  LEFT_GROUP,  ignore_bits=RIGHT_GROUP)
-        set_articulation_collision_group(right_model.hand, RIGHT_GROUP, ignore_bits=LEFT_GROUP)
-
-    # 4) Initialize keypoints (dots positions) only for models we created
-    if left_model is not None:
-        l_links, l_offsets = [], []
-        for info in left_config["fingertip_link"]:
-            l_links.append(info["link"])
-            l_offsets.append(info["center_offset"])
-        left_model.initialize_keypoint(l_links, l_offsets)
-
-    if right_model is not None:
-        r_links, r_offsets = [], []
-        for info in right_config["fingertip_link"]:
-            r_links.append(info["link"])
-            r_offsets.append(info["center_offset"])
-        right_model.initialize_keypoint(r_links, r_offsets)
-
-    # 5) One viewer env for whichever models are present
+    # 3) Viewer env (creates fingertip spheres for every model)
     viewer_env = HandViewerEnv(models, scene=shared_scene, renderer=renderer)
 
-    # 6) Control loop for the active models
-    #    Build per-model metadata so the loop stays generic.
+    # 4) Control loop — re-randomize qpos targets every 30 sim steps
     model_infos = []
-    if left_model is not None:
-        l_lower, l_upper = left_model.get_joint_limit()
-        model_infos.append({"model": left_model, "lower": l_lower, "upper": l_upper})
-    if right_model is not None:
-        r_lower, r_upper = right_model.get_joint_limit()
-        model_infos.append({"model": right_model, "lower": r_lower, "upper": r_upper})
+    for m in models:
+        lo, hi = m.get_joint_limit()
+        model_infos.append({"model": m, "lower": lo, "upper": hi})
 
+    # Helper: compute initial qpos per model based on --pose choice.
+    def _qpos_for_pose(pose_choice, lower, upper, dof):
+        if pose_choice == "zero":
+            return np.zeros(dof)
+        elif pose_choice == "mid":
+            return (np.asarray(lower) + np.asarray(upper)) / 2
+        else:  # "random" — initial random sample (the loop below will keep cycling)
+            return np.random.uniform(0, 1, dof) * (upper - lower - 1e-7) + lower + 1e-7
+
+    # Apply initial pose to every model before entering the loop.
+    for info in model_infos:
+        mdl = info["model"]
+        lower, upper = info["lower"], info["upper"]
+        qpos_user = _qpos_for_pose(args.pose, lower, upper, mdl.get_n_dof())
+        qpos_user = np.clip(qpos_user,
+                            np.asarray(lower) + 1e-3,
+                            np.asarray(upper) - 1e-3)
+        if args.kinematic:
+            qpos_sim = mdl.convert_user_order_to_sim_order(qpos_user)
+            mdl.hand.set_qpos(qpos_sim)
+            mdl.hand.set_qvel(np.zeros_like(qpos_sim))
+        else:
+            mdl.set_qpos_target(qpos_user)
+
+    # Main loop: render and (if pose == "random") re-sample targets periodically.
+    #   physics mode   : viewer_env.update() steps physics; PD drives joints
+    #                    toward target. Fluid for allegro, wobbles for 5-finger v6.
+    #   kinematic mode : skip scene.step(); set_qpos snaps the articulation
+    #                    instantly. Use this for verification (coord frame,
+    #                    fingertip offsets) — the rendered pose is exactly
+    #                    what GeoRT's FK would compute.
+    #   pose != random : static — skip the resampling block entirely so the
+    #                    hand holds one pose indefinitely. Ideal for offset
+    #                    checks (`--pose zero` gives fully-extended fingers).
     steps = 0
     while True:
-        viewer_env.update()
+        if args.kinematic:
+            viewer_env._update_tip_positions()
+            viewer_env._update_axis_markers()
+            viewer_env.scene.update_render()
+            viewer_env.viewer.render()
+        else:
+            viewer_env.update()
         steps += 1
-        if steps % 30 == 0:
+        if steps % 30 == 0 and args.pose == "random":
             for info in model_infos:
                 mdl, lower, upper = info["model"], info["lower"], info["upper"]
                 dof = mdl.get_n_dof()
                 targets = np.random.uniform(0, 1, dof) * (upper - lower - 1e-7) + lower + 1e-7
-                mdl.set_qpos_target(targets)
+                if args.kinematic:
+                    # Clip slightly inside limits (matches set_qpos_target's
+                    # epsilon margin) then snap via sapien articulation API.
+                    targets_clipped = np.clip(targets,
+                                              np.asarray(lower) + 1e-3,
+                                              np.asarray(upper) - 1e-3)
+                    qpos_sim = mdl.convert_user_order_to_sim_order(targets_clipped)
+                    mdl.hand.set_qpos(qpos_sim)
+                    mdl.hand.set_qvel(np.zeros_like(qpos_sim))
+                else:
+                    mdl.set_qpos_target(targets)

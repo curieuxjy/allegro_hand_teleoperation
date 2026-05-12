@@ -43,40 +43,72 @@ def _compute_grad_norm_and_vec(loss_term, params, retain_graph=True):
     norm = float(vec.norm().item()) if vec.numel() > 0 else 0.0
     return norm, vec
 
-def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_name, human_name="unknown", robot_name="unknown", RIGHT=True):
+def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_name, human_name="unknown", robot_name="unknown", RIGHT=True, scale=1.0):
+    """Render per-finger + combined chamfer visualization HTML.
+
+    Works for any number of fingers `n` (was previously hardcoded to 4):
+      - small subplots are laid out in 2 rows x ceil(n/2) cols on the left
+      - the right-most column holds a "All fingers" plot spanning both rows
+    `scale` is recorded in the title but not used to transform coordinates
+    (caller already applies scale to the human points before computing dmat/nn).
+    """
+    import math
     assert len(inp_list) == len(tgt_list) == len(dmat_list) == len(nn_idx_list)
-    n = len(inp_list)  # expected number of columns (should be 4)
+    n = len(inp_list)
 
     if n == 0:
         print("[warning] draw_chamfer_loss: empty input lists, nothing to plot.")
         return
 
-    # Layout: 2 rows x 3 cols. Right-most column will span both rows for the big plot.
+    # Layout: 2 rows x (small_cols + 1) cols. Last col spans both rows for the big plot.
+    small_cols = max(2, math.ceil(n / 2))
+    total_cols = small_cols + 1
+
     specs = [
-        [{"type": "scene"}, {"type": "scene"}, {"type": "scene", "rowspan": 2}],
-        [{"type": "scene"}, {"type": "scene"}, None]
+        [{"type": "scene"} for _ in range(small_cols)] + [{"type": "scene", "rowspan": 2}],
+        [{"type": "scene"} for _ in range(small_cols)] + [None],
     ]
 
-    # Titles for small 2x2 grid (left) and big plot (right)
-    col_titles = fig_finger_name #  ["index", "middle", "ring", "thumb"] # json order
-    # subplot_titles needs length rows*cols = 6; put None for the cell covered by rowspan
-    subplot_titles = [col_titles[0], col_titles[1], "All fingers", col_titles[2], col_titles[3], None]
+    col_titles = fig_finger_name  # config json order, length == n
+    # subplot_titles must have length rows*cols (=2*total_cols).
+    # Order: row1 left-to-right, then row2 left-to-right.
+    subplot_titles = []
+    # Row 1
+    for i in range(small_cols):
+        subplot_titles.append(col_titles[i] if i < n else "")
+    subplot_titles.append("All fingers")
+    # Row 2
+    for i in range(small_cols):
+        idx = small_cols + i
+        subplot_titles.append(col_titles[idx] if idx < n else "")
+    subplot_titles.append(None)  # covered by rowspan
 
-    figp = make_subplots(rows=2, cols=3,
-                        specs=specs,
-                        subplot_titles=subplot_titles,
-                        column_widths=[0.25, 0.25, 0.5],
-                        row_heights=[0.5, 0.5],
-                        horizontal_spacing=0.06, vertical_spacing=0.06)
-                        # horizontal_spacing=0.07, vertical_spacing=0.07)
+    # widths: small cols share the left half, big plot gets the right half
+    small_width = 0.5 / small_cols
+    column_widths = [small_width] * small_cols + [0.5]
 
-    # mapping small subplot positions (index order -> subplot position)
-    small_positions = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    figp = make_subplots(
+        rows=2, cols=total_cols,
+        specs=specs,
+        subplot_titles=subplot_titles,
+        column_widths=column_widths,
+        row_heights=[0.5, 0.5],
+        horizontal_spacing=0.04, vertical_spacing=0.06,
+    )
 
-    # colors per finger for the big combined plot
-    finger_colors = ['blue', 'green', 'magenta', 'orange']
-    # darker variants for target points (minimal change)
-    human_data_colors = ['darkblue', 'darkgreen', 'darkmagenta', 'darkorange']
+    # mapping: small subplot index -> (row, col).
+    # Fill row 1 left-to-right, then row 2 left-to-right.
+    small_positions = []
+    for i in range(small_cols):
+        small_positions.append((1, i + 1))
+    for i in range(small_cols):
+        small_positions.append((2, i + 1))
+
+    # cycle colors for arbitrary finger count
+    finger_colors_pool = ['blue', 'green', 'magenta', 'orange', 'red', 'cyan', 'purple', 'olive']
+    human_colors_pool  = ['darkblue', 'darkgreen', 'darkmagenta', 'darkorange', 'darkred', 'darkcyan', 'indigo', 'darkolivegreen']
+    finger_colors = [finger_colors_pool[i % len(finger_colors_pool)] for i in range(n)]
+    human_data_colors = [human_colors_pool[i % len(human_colors_pool)] for i in range(n)]
 
     # add each finger's small subplot and also collect traces for the big plot
     for idx in range(n):
@@ -126,7 +158,7 @@ def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_nam
                             marker=dict(size=3, opacity=0.6, color=human_data_colors[idx]),
                             name=f'Input {col_titles[idx]}',
                             showlegend=True)
-        figp.add_trace(big_inp, row=1, col=3)
+        figp.add_trace(big_inp, row=1, col=total_cols)
 
         # Target points (per-finger)
         big_tgt = go.Scatter3d(x=tgt0[:, 0], y=tgt0[:, 1], z=tgt0[:, 2],
@@ -134,7 +166,7 @@ def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_nam
                             marker=dict(size=2, opacity=0.4, color=finger_colors[idx], symbol='diamond'),
                             name=f'Target {col_titles[idx]}',
                             showlegend=True)
-        figp.add_trace(big_tgt, row=1, col=3)
+        figp.add_trace(big_tgt, row=1, col=total_cols)
 
         # Optional: connections in big plot (light, optional)
         big_xs, big_ys, big_zs = [], [], []
@@ -148,7 +180,7 @@ def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_nam
                                 opacity=0.9,
                                 name=f'Conn {col_titles[idx]}',
                                 showlegend=True)
-        figp.add_trace(big_conn, row=1, col=3)
+        figp.add_trace(big_conn, row=1, col=total_cols)
 
     # set axis titles for all scene subplots (iterate over scene keys)
     for key in list(figp.layout):
@@ -160,7 +192,7 @@ def draw_chamfer_loss(inp_list, tgt_list, dmat_list, nn_idx_list, fig_finger_nam
                 figp.layout[key].xaxis.title.text = 'X'
 
     # layout tuning: bigger size, legend on top, margins
-    title_str = "Chamfer Distance — left: per-finger | right: all fingers"
+    title_str = f"Chamfer Distance — left: per-finger | right: all fingers (scale={scale})"
     figp.update_layout(
         title=title_str,
         height=1000,

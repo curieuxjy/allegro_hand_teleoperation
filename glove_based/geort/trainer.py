@@ -35,6 +35,7 @@ from geort.env.hand import HandKinematicModel
 from geort.formatter import HandFormatter
 from geort.loss import chamfer_distance
 from geort.model import FKModel, IKModel
+from geort.collision_classifier import load_classifier as load_collision_classifier
 from geort.utils.config_utils import get_config, save_json
 from geort.utils.hand_utils import get_active_joints, get_active_joint_indices, get_entity_by_name
 from geort.utils.path import get_checkpoint_root, get_data_root, get_human_data
@@ -341,6 +342,25 @@ class GeoRTTrainer:
         params = list(ik_model.parameters())
         os.makedirs(get_checkpoint_root(), exist_ok=True)
 
+        # Optional: pretrained collision classifier (frozen). Used only when
+        # --w_collision > 0. Gradients flow through it to ik_model but its
+        # own weights are not updated. See GeoRT paper, Criterion V.
+        w_collision_kw = kwargs.get("w_collision", 0.0)
+        collision_classifier = None
+        if w_collision_kw > 0.0:
+            collision_classifier = load_collision_classifier(self.config["name"], device="cuda")
+            if collision_classifier is None:
+                ckpt_hint = (Path(get_checkpoint_root()) /
+                             f"collision_classifier_{self.config['name']}.pth")
+                raise FileNotFoundError(
+                    f"--w_collision={w_collision_kw} requires a pretrained collision "
+                    f"classifier at {ckpt_hint}.\n"
+                    f"Generate the dataset and train the classifier first:\n"
+                    f"  python glove_based/geort/collision_data.py --hand {self.config['name']}.json\n"
+                    f"  python glove_based/geort/collision_classifier.py --hand {self.config['name']}.json"
+                )
+            print("[Collision] Loaded frozen collision classifier — collision loss enabled.")
+
         # Optimizer
         ik_optim = optim.AdamW(ik_model.parameters(), lr=1e-4)
 
@@ -462,7 +482,7 @@ class GeoRTTrainer:
             viz_robot_points = None
 
         # Loss normalization stats
-        loss_keys = ['direction', 'chamfer', 'curvature', 'pinch']
+        loss_keys = ['direction', 'chamfer', 'curvature', 'pinch', 'collision']
         loss_stats = {k: {"m": 0.0, "ms": 0.0, "initialized": False} for k in loss_keys} if normalize_losses else None
         eps = 1e-6
 
@@ -555,8 +575,18 @@ class GeoRTTrainer:
                 direction_loss = -(((F.normalize(d1, dim=-1, p=2, eps=1e-5) *
                                     F.normalize(d2, dim=-1, p=2, eps=1e-5)).sum(-1))).mean()
 
-                # Collision Loss (placeholder)
-                collision_loss = torch.tensor([0.0]).cuda().squeeze()
+                # Collision Loss via pretrained classifier (frozen). The IK
+                # output `joint` is already in normalized [-1, 1] space (Tanh),
+                # which matches the classifier's training input space — see
+                # collision_classifier.py. The negative-log form pushes the IK
+                # toward joint configurations the classifier deems unlikely
+                # to be in self-collision.  L_col = -E[log(1 - sigmoid(C(q)))]
+                if collision_classifier is not None:
+                    col_logit = collision_classifier(joint).squeeze(-1)   # (B,)
+                    col_prob = torch.sigmoid(col_logit)
+                    collision_loss = -torch.log(1.0 - col_prob + 1e-7).mean()
+                else:
+                    collision_loss = torch.tensor(0.0, device=point.device)
 
                 # --------------------------------------------------------
                 # Compose Weighted Loss
@@ -567,6 +597,7 @@ class GeoRTTrainer:
                     'chamfer': (w_chamfer, chamfer_loss),
                     'curvature': (w_curvature, curvature_loss),
                     'pinch': (w_pinch, pinch_loss),
+                    'collision': (w_collision, collision_loss),
                 }
 
                 # Optional: Normalize losses
@@ -671,6 +702,7 @@ class GeoRTTrainer:
                 f" - Chamfer: {format_loss(float(chamfer_loss.detach().cpu().item()))}"
                 f" - Curvature: {format_loss(float(curvature_loss.detach().cpu().item()))}"
                 f" - Pinch: {format_loss(float(pinch_loss.detach().cpu().item()))}"
+                f" - Collision: {format_loss(float(collision_loss.detach().cpu().item()))}"
                 f" | Time: {epoch_time:.2f}s"
             )
 
@@ -779,15 +811,22 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_tag', type=str, default='',
                        help='Checkpoint tag for experiment naming')
 
-    # Loss weights
+    # Loss weights — defaults set per GeoRT paper (arxiv 2503.07541v1)
+    # implementation section: λ₁ ∈ [10, 100], λ₂ = 1, λ₃ ∈ [10³, 10⁶],
+    # λ₄ ∈ [10⁻⁴, 10⁻²]; direction term has implicit weight 1.
+    # Previous in-repo defaults (kept as backup if paper values regress):
+    #   --w_chamfer   80.0   (still in paper range, unchanged)
+    #   --w_curvature 0.15   -> paper value 1.0
+    #   --w_pinch     1.0    -> paper range middle ~1e4
+    #   --w_collision 0.0    -> paper range geometric mean 1e-3
     parser.add_argument('--w_chamfer', type=float, default=80.0,
-                       help='Chamfer distance loss weight')
-    parser.add_argument('--w_curvature', type=float, default=0.15,
-                       help='Curvature smoothness loss weight')
-    parser.add_argument('--w_collision', type=float, default=0.0,
-                       help='Collision avoidance loss weight')
-    parser.add_argument('--w_pinch', type=float, default=1.0,
-                       help='Pinch detection loss weight')
+                       help='Chamfer distance loss weight (paper: [10, 100])')
+    parser.add_argument('--w_curvature', type=float, default=1.0,
+                       help='Curvature smoothness loss weight (paper: 1)')
+    parser.add_argument('--w_collision', type=float, default=2.0,
+                       help='Collision avoidance loss weight (paper: [1e-4, 1e-2])')
+    parser.add_argument('--w_pinch', type=float, default=1e3,
+                       help='Pinch detection loss weight (paper: [1e3, 1e6])')
 
     # Wandb configuration
     parser.add_argument('--wandb_project', type=str, default='geort',
@@ -820,7 +859,7 @@ if __name__ == '__main__':
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
     FK_ITER = 200
-    IK_ITER = 2500
+    IK_ITER = 2000 # 2500
     HUMAN_POINT_DATASET_N = 20000
     POINT_BATCH_SIZE = 4096
     W_CHAMFER = args.w_chamfer

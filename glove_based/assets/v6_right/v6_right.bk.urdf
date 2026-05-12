@@ -237,9 +237,9 @@
       link="thumb_2" />
     <axis
       xyz="0 -1 0" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -296,9 +296,9 @@
       link="thumb_3" />
     <axis
       xyz="0 -1 0" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -476,9 +476,9 @@
       link="index_2" />
     <axis
       xyz="0.99863 0 -0.052336" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -535,9 +535,9 @@
       link="index_3" />
     <axis
       xyz="0.99863 0 -0.052336" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -715,9 +715,9 @@
       link="middle_2" />
     <axis
       xyz="1 0 0" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -774,9 +774,9 @@
       link="middle_3" />
     <axis
       xyz="1 0 0" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -954,9 +954,9 @@
       link="ring_2" />
     <axis
       xyz="0.99863 0 0.052336" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -1013,9 +1013,9 @@
       link="ring_3" />
     <axis
       xyz="0.99863 0 0.052336" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -1193,9 +1193,9 @@
       link="pinky_2" />
     <axis
       xyz="0.99452 0 0.10453" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />
@@ -1252,9 +1252,9 @@
       link="pinky_3" />
     <axis
       xyz="0.99452 0 0.10453" />
-    <!-- -5 deg / 90 deg -->
+    <!-- -90 deg / 90 deg -->
     <limit
-      lower="-0.087266"
+      lower="-1.5708"
       upper="1.5708"
       effort="0.38"
       velocity="8.70" />

@@ -19,7 +19,8 @@
             "name": "index",
             "link": "index_3",
             "joint": ["joint_10", "joint_11", "joint_12", "joint_13"],
-            "center_offset": [0.0, 0.0, 0.050],
+            "_offset_note": "magnitude 0.047, tilt 3.76 deg from local +Z toward +X (per index_3 inertial COM direction)",
+            "center_offset": [0.0031, 0.0, 0.0469],
             "human_hand_id": 8
         },
 
@@ -27,7 +28,8 @@
             "name": "middle",
             "link": "middle_3",
             "joint": ["joint_20", "joint_21", "joint_22", "joint_23"],
-            "center_offset": [0.0, 0.0, 0.050],
+            "_offset_note": "magnitude 0.047, tilt 0.77 deg from local +Z (essentially aligned)",
+            "center_offset": [0.0006, 0.0, 0.0470],
             "human_hand_id": 12
         },
 
@@ -35,7 +37,8 @@
             "name": "ring",
             "link": "ring_3",
             "joint": ["joint_30", "joint_31", "joint_32", "joint_33"],
-            "center_offset": [0.0, 0.0, 0.050],
+            "_offset_note": "magnitude 0.047, tilt 2.25 deg from local +Z toward -X",
+            "center_offset": [-0.0018, 0.0, 0.0470],
             "human_hand_id": 16
         },
 
@@ -43,7 +46,8 @@
             "name": "pinky",
             "link": "pinky_3",
             "joint": ["joint_40", "joint_41", "joint_42", "joint_43"],
-            "center_offset": [0.050, 0.0, 0.0],
+            "_offset_note": "magnitude 0.06, tilt 4.3 deg from local +Z toward -X (inertia long-axis eigvec; COM-derived 8 deg was over-tilted because asymmetric internal mass shifts COM more than the geometric long-axis)",
+            "center_offset": [-0.0045, 0.0011, 0.0598],
             "human_hand_id": 20
         },
 
@@ -51,7 +55,8 @@
             "name": "thumb",
             "link": "thumb_3",
             "joint": ["joint_00", "joint_01", "joint_02", "joint_03"],
-            "center_offset": [0.050, 0.0, 0.0],
+            "_offset_note": "magnitude 0.06, tilt 2.06 deg from local +X toward +Y (COM-direction)",
+            "center_offset": [0.0600, 0.0022, 0.0],
             "human_hand_id": 4
         }
     ]

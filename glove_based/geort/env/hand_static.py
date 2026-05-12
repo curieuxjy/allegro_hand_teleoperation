@@ -11,15 +11,28 @@ Features:
 - Colors each link differently for visual distinction
 - Prints joint/link tree with limits
 - No motion, no controllers - just a static render loop
+- Tiny RGB axes drawn at the config's base_link (for v6 this is `virtual_base`,
+  so the axes appear at the GeoRT-aligned palm/middle-finger reference frame)
+
+CLI:
+  --hand <name>   config name (e.g., 'allegro_right', 'v6_right'). The URDF
+                  path is read from the config, so any hand defined under
+                  glove_based/geort/config/ is supported automatically.
+  --handness {left,right}   legacy shortcut for allegro_{left,right}.
+                  Ignored if --hand is given.
 """
 
 import argparse
 import colorsys
 import random
+from pathlib import Path
 
 import numpy as np
 import sapien.core as sapien
 from sapien.utils import Viewer
+
+from geort.utils.config_utils import get_config
+from geort.utils.hand_utils import get_entity_by_name
 
 
 def make_scene(enable_render=True):
@@ -175,8 +188,12 @@ def place_tiny_axes(scene, pose, length=0.03, radius=0.0015):
 def main():
     """Main entry point for the static URDF viewer."""
     parser = argparse.ArgumentParser(description="Static URDF link/joint inspector with coloring")
-    parser.add_argument("--handness", type=str, required=True, choices=["left", "right"],
-                        help="Specify handness (left or right)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--hand", type=str, default=None,
+                       help="Config name (e.g., 'allegro_right', 'v6_right'). "
+                            "Loads URDF + base_link from glove_based/geort/config/<name>.json.")
+    group.add_argument("--handness", type=str, choices=["left", "right"], default=None,
+                       help="Legacy shortcut: maps to allegro_left / allegro_right.")
     parser.add_argument("--no-fix-root", action="store_true", help="Do not fix root link")
     parser.add_argument("--seed", type=int, default=0, help="Color randomness seed")
     args = parser.parse_args()
@@ -184,10 +201,22 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    if args.handness == "left":
-        urdf_path = "./assets/allegro_left/allegro_hand_left.urdf"
+    # Resolve which config to load.
+    if args.hand is not None:
+        config_name = args.hand
+    elif args.handness is not None:
+        config_name = f"allegro_{args.handness}"
     else:
-        urdf_path = "./assets/allegro_right/allegro_hand_right.urdf"
+        parser.error("Pass either --hand <name> or --handness {left,right}.")
+
+    config = get_config(config_name)
+
+    # URDF path: configs use "./xxx" relative to glove_based/. Resolve to absolute
+    # path the same way env/hand.py does so the loader can find the file from any CWD.
+    urdf_path = config["urdf_path"]
+    if urdf_path.startswith("./"):
+        glove_based_dir = Path(__file__).resolve().parent.parent.parent
+        urdf_path = str(glove_based_dir / urdf_path[2:])
 
     engine, scene, renderer = make_scene(enable_render=True)
     art = load_articulation(scene, urdf_path, fix_root=not args.no_fix_root)
@@ -198,13 +227,18 @@ def main():
     # Console summary
     print_tree(art)
 
-    # Optional: draw tiny axes at the base link to help orientation
+    # Draw tiny axes at the config's base_link (so v6_right's virtual_base shows
+    # the GeoRT-aligned frame, not the wrist-mounted base_link). Fall back to the
+    # first link if the named base_link can't be resolved.
     try:
-        base_link = art.get_links()[0]
+        base_link_name = config.get("base_link", None)
+        base_link = (get_entity_by_name(art.get_links(), base_link_name)
+                     if base_link_name else None) or art.get_links()[0]
         base_pose = base_link.get_pose()
         place_tiny_axes(scene, base_pose)
-    except Exception:
-        pass
+        print(f"\nAxes drawn at link: {base_link.get_name()}")
+    except Exception as e:
+        print(f"\n[warn] could not draw axes at base_link: {e}")
 
     # Viewer
     viewer = Viewer(renderer)

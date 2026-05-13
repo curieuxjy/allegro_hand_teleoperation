@@ -811,21 +811,25 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_tag', type=str, default='',
                        help='Checkpoint tag for experiment naming')
 
-    # Loss weights — defaults set per GeoRT paper (arxiv 2503.07541v1)
-    # implementation section: λ₁ ∈ [10, 100], λ₂ = 1, λ₃ ∈ [10³, 10⁶],
-    # λ₄ ∈ [10⁻⁴, 10⁻²]; direction term has implicit weight 1.
-    # Previous in-repo defaults (kept as backup if paper values regress):
-    #   --w_chamfer   80.0   (still in paper range, unchanged)
-    #   --w_curvature 0.15   -> paper value 1.0
-    #   --w_pinch     1.0    -> paper range middle ~1e4
-    #   --w_collision 0.0    -> paper range geometric mean 1e-3
-    parser.add_argument('--w_chamfer', type=float, default=80.0,
+    # Loss weights — direction term has implicit weight 1.0 (hardcoded in
+    # weighted_losses['direction']). All other weights are tuned so that
+    # direction loss becomes relatively more influential — this is the term
+    # that preserves the human-input → robot-output positional correspondence
+    # (chamfer only enforces "valid robot pose" / distribution shape, which
+    # can bias toward the dense mid-flex region of the random-qpos dataset).
+    #
+    # History of defaults:
+    #   In-repo:    chamfer 80.0   curvature 0.15  pinch 1.0    collision 0.0
+    #   Paper:      chamfer 80.0   curvature 1.0   pinch 1e4    collision 1e-3
+    #   Previous:   chamfer 500    curvature 1e6   pinch 1      collision 1
+    #   Current (1/10 of "Previous", direction-relative scale):
+    parser.add_argument('--w_chamfer', type=float, default=80,
                        help='Chamfer distance loss weight (paper: [10, 100])')
-    parser.add_argument('--w_curvature', type=float, default=1.0,
+    parser.add_argument('--w_curvature', type=float, default=1e5,
                        help='Curvature smoothness loss weight (paper: 1)')
-    parser.add_argument('--w_collision', type=float, default=2.0,
+    parser.add_argument('--w_collision', type=float, default=0.1,
                        help='Collision avoidance loss weight (paper: [1e-4, 1e-2])')
-    parser.add_argument('--w_pinch', type=float, default=1e3,
+    parser.add_argument('--w_pinch', type=float, default=5,
                        help='Pinch detection loss weight (paper: [1e3, 1e6])')
 
     # Wandb configuration
@@ -858,8 +862,8 @@ if __name__ == '__main__':
 
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
-    FK_ITER = 200
-    IK_ITER = 2000 # 2500
+    FK_ITER = 250
+    IK_ITER = 1500 # 2500
     HUMAN_POINT_DATASET_N = 20000
     POINT_BATCH_SIZE = 4096
     W_CHAMFER = args.w_chamfer

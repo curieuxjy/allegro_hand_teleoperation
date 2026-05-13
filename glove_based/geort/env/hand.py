@@ -134,6 +134,13 @@ class HandKinematicModel:
     def convert_user_order_to_sim_order(self, qpos):
         return qpos[self.sim_idx_to_user_idx]
 
+    def convert_sim_order_to_user_order(self, qpos_sim):
+        """Inverse of convert_user_order_to_sim_order: simulator joint order
+        -> user-specified joint order (the order in config's joint_order).
+        Useful for recording the qpos actually achieved by physics after a
+        step, in the same order the IK model uses."""
+        return qpos_sim[self.user_idx_to_sim_idx]
+
     def keypoint_from_qpos(self, qpos, ret_vec=False):
         '''
             Get keypoints from hand qpos. qpos is specified using the user order.

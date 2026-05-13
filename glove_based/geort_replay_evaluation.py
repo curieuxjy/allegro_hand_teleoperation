@@ -7,6 +7,30 @@ from geort.env.hand_static import color_links
 from geort import load_model, get_config
 
 
+def disable_self_collision(articulation):
+    """Filter out all intra-articulation collisions by putting every link in
+    the same group with a mask that EXCLUDES that group. Hand-vs-other-objects
+    collisions still work; only hand-vs-itself is suppressed."""
+    GROUP = 0x0001
+    MASK = 0xFFFE  # all bits except GROUP
+    for link in articulation.get_links():
+        try:
+            shapes = link.get_collision_shapes()
+        except AttributeError:
+            shapes = []
+        for shape in shapes:
+            for sig in ((GROUP, MASK, 0, 0), (GROUP, MASK), (GROUP,)):
+                try:
+                    shape.set_collision_group(*sig)
+                    break
+                except (AttributeError, TypeError):
+                    try:
+                        shape.set_collision_groups(*sig)
+                        break
+                    except (AttributeError, TypeError):
+                        pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--hand', type=str, default='allegro')
@@ -18,6 +42,19 @@ def main():
                         help="Snap qpos directly each frame instead of PD-driving through "
                              "physics. Disables self-collision wobble — useful for inspecting "
                              "what the IK actually predicts. Default off (uses physics).")
+    # Physics-mode stability knobs (ignored under --kinematic).
+    parser.add_argument('--kp', type=float, default=400.0,
+                        help='PD position gain (default 400). Lower = softer spring.')
+    parser.add_argument('--kd', type=float, default=40.0,
+                        help='PD velocity gain (default 40 — bumped from in-repo default 10 '
+                             'for dense 5-finger hands; gives damping ratio ~1.0 with kp=400).')
+    parser.add_argument('--force_limit', type=float, default=10.0,
+                        help='Per-joint force limit Nm (default 10). Caps how hard PD can push.')
+    parser.add_argument('--no_self_collision', action='store_true',
+                        help='Disable intra-articulation collision detection. The hand still '
+                             'collides with external objects (e.g. ground), but PhysX no longer '
+                             'fights self-overlap — eliminates the most common cause of '
+                             'replay-mode divergence.')
 
     args = parser.parse_args()
 
@@ -35,6 +72,19 @@ def main():
     # Tint each link a distinct random color so finger boundaries / collisions
     # are easy to read visually (uses the same helper as hand_static.py).
     color_links(hand.get_renderer(), hand.hand)
+
+    # Override PD gains + force limit on every active joint. The defaults in
+    # HandKinematicModel.__init__ (kp=400, kd=10) are underdamped for v6's
+    # 5-finger packing — joints oscillate when target jumps and self-collision
+    # pushes them around. kd=40 with kp=400 gives a near-critically-damped
+    # response.
+    for joint in hand.all_joints:
+        joint.set_drive_property(args.kp, args.kd, force_limit=args.force_limit)
+
+    if args.no_self_collision:
+        disable_self_collision(hand.hand)
+        print('[replay] self-collision disabled (intra-articulation contacts filtered)')
+
     viewer_env = hand.get_viewer_env()
 
     # Run!

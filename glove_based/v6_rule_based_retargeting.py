@@ -46,6 +46,7 @@ CLI
 import sys
 import argparse
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -101,45 +102,47 @@ class ManusV6SimNode(Node):
     so no lock is needed between the ROS callback and the slider thread.
     """
 
-    # Step 2 default scales — joint_00 and joint_40 use TWO entries each
-    # because curl and spread are mixed (see commentary inline in transform).
+    # Step 2 default scales — all stored as POSITIVE magnitudes (>= 0).
+    # The sign of each contribution is hardcoded in `transform_glove_to_v6`
+    # (e.g. `-(s['t00_curl']*v[1] + s['t00_spread']*v[0])`). joint_00 and
+    # joint_40 use TWO entries each because curl and spread are mixed.
     DEFAULT_SCALES = {
         # Thumb
-        't00_curl':   -0.5,
-        't00_spread': -1.5,
-        't01':         1.5,
+        't00_curl':    1.0,
+        't00_spread':  1.0,
+        't01':         1.0,
         't02':         1.0,
         't03':         1.0,
         # Index
         'i10':         1.0,
-        'i11':         1.5,
+        'i11':         1.0,
         'i12':         1.0,
-        'i13':         2.0,
+        'i13':         1.0,
         # Middle
-        'm20':         0.3,
-        'm21':         1.5,
+        'm20':         1.0,
+        'm21':         1.0,
         'm22':         1.0,
-        'm23':         2.0,
+        'm23':         1.0,
         # Ring
-        'r30':        -1.8,
-        'r31':         1.5,
-        'r32':         2.0,
-        'r33':         1.5,
+        'r30':         1.0,
+        'r31':         1.0,
+        'r32':         1.0,
+        'r33':         1.0,
         # Pinky
-        'p40_curl':   -0.5,
-        'p40_spread': -1.5,
-        'p41':        -0.9,
-        'p42':         2.5,
-        'p43':         2.0,
+        'p40_curl':    1.0,
+        'p40_spread':  1.0,
+        'p41':         1.0,
+        'p42':         1.0,
+        'p43':         1.0,
     }
 
     # Step 3 default offsets (degrees)
     DEFAULT_OFFSETS = {
-        'o_t00':  0.0, 'o_t01': 0.0, 'o_t02': 0.0, 'o_t03': -3.0,
-        'o_i10':  0.0, 'o_i11': 0.0, 'o_i12': 0.0, 'o_i13': -3.0,
-        'o_m20':  0.0, 'o_m21': 0.0, 'o_m22': 0.0, 'o_m23': -3.0,
-        'o_r30': -3.0, 'o_r31': 0.0, 'o_r32': 0.0, 'o_r33': -3.0,
-        'o_p40':  0.0, 'o_p41': -10.0, 'o_p42': -10.0, 'o_p43': -5.0,
+        'o_t00':  0.0, 'o_t01': 0.0, 'o_t02': 0.0, 'o_t03': 0.0,
+        'o_i10':  0.0, 'o_i11': 0.0, 'o_i12': 0.0, 'o_i13': 0.0,
+        'o_m20':  0.0, 'o_m21': 0.0, 'o_m22': 0.0, 'o_m23': 0.0,
+        'o_r30':  0.0, 'o_r31': 0.0, 'o_r32': 0.0, 'o_r33': 0.0,
+        'o_p40':  0.0, 'o_p41': 0.0, 'o_p42': 0.0, 'o_p43': 0.0,
     }
 
     TUNING_FILE = Path(__file__).resolve().parent / 'v6_tuning.json'
@@ -170,42 +173,69 @@ class ManusV6SimNode(Node):
         # Recording state (toggled from the tuner window)
         self.recording = False
         self.recorded_frames = []    # list of np.ndarray (20-D, radians)
+        self._rec_t0 = None          # monotonic time when recording started
+        self._rec_target_hz = 120.0  # last requested record rate
+        self._rec_period = 1.0 / 120.0
+        self._rec_next_t = None      # next scheduled save time (drift-corrected)
+        self.last_record_stats = None  # dict populated by stop_recording()
 
         topic = f'/manus_glove_{self.side}'
         self.create_subscription(ManusGlove, topic, self.glove_callback, 20)
         self.get_logger().info(f'Subscribed to {topic}')
 
-    def start_recording(self):
+    def start_recording(self, target_hz: float = 120.0):
+        # Clamp: glove publishes at 120 Hz, anything higher just records every frame.
+        target_hz = float(max(0.1, min(target_hz, 120.0)))
         self.recorded_frames = []
+        self._rec_t0 = time.monotonic()
+        self._rec_target_hz = target_hz
+        self._rec_period = 1.0 / target_hz
+        self._rec_next_t = None
         self.recording = True
-        self.get_logger().info('Motion recording started.')
+        self.get_logger().info(f'Motion recording started @ target {target_hz:.1f} Hz.')
 
     def stop_recording(self):
         """Stop recording and write frames as encoder counts to a timestamped .txt.
 
-        Format: one frame per line, 20 space-separated values in URDF order
+        Format: frames concatenated as `[v0, v1, ..., v19][v0, v1, ..., v19]...`
+        with 20 integer values per frame in URDF order
         (thumb → index → middle → ring → pinky), each value
-        = rad → deg × (4096 / 360).
+        = round(rad → deg × (4096 / 360)).
         Returns the saved Path on success, or None if nothing was recorded.
         """
         self.recording = False
+        elapsed = (time.monotonic() - self._rec_t0) if self._rec_t0 else 0.0
+        self._rec_t0 = None
         frames = self.recorded_frames
         self.recorded_frames = []
         n = len(frames)
         if n == 0:
             self.get_logger().warn('Recording stopped: no frames captured.')
             return None
+        fps = (n / elapsed) if elapsed > 0 else 0.0
         try:
             self.RECORDING_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
             path = self.RECORDING_DIR / f'motion_{ts}.txt'
             with open(path, 'w') as f:
                 for frame in frames:
+                    # File-only sign flip on the two "base swing" joints
+                    # (thumb joint_00 = idx 0, pinky joint_40 = idx 16).
+                    # The sim already used the un-flipped values.
+                    save_frame = frame.copy()
+                    save_frame[0]  *= -1
+                    save_frame[16] *= -1
                     counts = np.round(
-                        np.rad2deg(frame) * self.DEG_TO_COUNTS
+                        np.rad2deg(save_frame) * self.DEG_TO_COUNTS
                     ).astype(int)
-                    f.write(' '.join(str(c) for c in counts) + '\n')
-            self.get_logger().info(f'Saved {n} frames → {path}')
+                    f.write('[' + ', '.join(str(c) for c in counts) + ']')
+            self.get_logger().info(
+                f'Saved {n} frames over {elapsed:.2f}s '
+                f'→ {fps:.1f} Hz → {path}'
+            )
+            self.last_record_stats = {
+                'n': n, 'elapsed': elapsed, 'fps': fps, 'path': path,
+            }
             return path
         except OSError as e:
             self.get_logger().error(f'Recording save failed: {e}')
@@ -279,15 +309,16 @@ class ManusV6SimNode(Node):
 
         # ====================================================================
         # Step 2: Per-joint scale (multiplication, in degrees), URDF order.
-        #   Coefficients come from self.scales (mutable — sliders can override).
-        #   joint_00 and joint_40 mix curl (val[1]) + spread (val[0]) since
-        #   their v6 axes act as "CMC-like swings" rather than pure spreads.
+        #   All `s[...]` values are POSITIVE magnitudes (sliders 0..mag);
+        #   the sign of each term is fixed here in code so the slider only
+        #   controls magnitude, never direction. joint_00 and joint_40 mix
+        #   curl (val[1]) and spread (val[0]) — see per-line comments.
         # ====================================================================
         s = self.scales
         angle_deg = np.array([
             # ----- Thumb (joint_00..03) -----
-            s['t00_curl']   * thumb_vals[1] + s['t00_spread'] * thumb_vals[0],
-            s['t01']        * thumb_vals[1],
+            (s['t00_curl']   * thumb_vals[1] + s['t00_spread'] * thumb_vals[0]),
+            -s['t01']        * thumb_vals[1],
             s['t02']        * thumb_vals[2],
             s['t03']        * thumb_vals[3],
             # ----- Index (joint_10..13) -----
@@ -306,8 +337,12 @@ class ManusV6SimNode(Node):
             s['r32']        * ring_vals[2],
             s['r33']        * ring_vals[3],
             # ----- Pinky (joint_40..43) -----
-            s['p40_curl']   * pinky_vals[1] + s['p40_spread'] * pinky_vals[0],
-            s['p41']        * pinky_vals[1],
+            # joint_40 (CMC base swing): sliders show positive magnitudes
+            # (0..3.5), but the curl and spread contributions enter the joint
+            # with opposite signs — `-curl*v[1] + spread*v[0]`. Equivalent to
+            # `-(curl*v[1] - spread*v[0])`.
+            -(s['p40_curl'] * pinky_vals[1] + s['p40_spread'] * pinky_vals[0]),
+            -(s['p41']        * pinky_vals[1]),
             s['p42']        * pinky_vals[2],
             s['p43']        * pinky_vals[3],
         ], dtype=float)
@@ -391,7 +426,34 @@ class ManusV6SimNode(Node):
         return glove20
 
     def glove_callback(self, msg: ManusGlove):
-        """Compute V6 qpos from incoming glove data and stash it."""
+        """Compute V6 qpos from incoming glove data and stash it.
+
+        ergonomics:
+        - type: ThumbMCPSpread
+        - type: ThumbMCPStretch
+        - type: ThumbPIPStretch
+        - type: ThumbDIPStretch
+
+        - type: IndexMCPStretch
+        - type: IndexPIPStretch
+        - type: IndexDIPStretch
+
+        - type: MiddleSpread
+        - type: MiddleMCPStretch
+        - type: MiddlePIPStretch
+        - type: MiddleDIPStretch
+
+        - type: RingSpread
+        - type: RingMCPStretch
+        - type: RingPIPStretch
+        - type: RingDIPStretch
+
+        - type: PinkySpread
+        - type: PinkyMCPStretch
+        - type: PinkyPIPStretch
+        - type: PinkyDIPStretch
+
+        """
         if len(msg.ergonomics) == 0:
             return
 
@@ -400,7 +462,19 @@ class ManusV6SimNode(Node):
         self.latest_qpos = self.transform_glove_to_v6(glove20)
 
         if self.recording:
-            self.recorded_frames.append(self.latest_qpos.copy())
+            # Drift-corrected scheduler: advance `_rec_next_t` by exactly one
+            # period per save so the average rate converges to target even when
+            # the target period isn't a multiple of the 8.33ms glove period.
+            now = time.monotonic()
+            if self._rec_next_t is None:
+                self.recorded_frames.append(self.latest_qpos.copy())
+                self._rec_next_t = now + self._rec_period
+            elif now >= self._rec_next_t:
+                self.recorded_frames.append(self.latest_qpos.copy())
+                self._rec_next_t += self._rec_period
+                # Resync if we fell badly behind (e.g., after a long pause).
+                if now > self._rec_next_t:
+                    self._rec_next_t = now + self._rec_period
 
         if not self._got_first:
             self._got_first = True
@@ -700,6 +774,11 @@ class TuningSliders:
     _FONT_SLIDER  = ('TkDefaultFont', 10)
     _FONT_BUTTON  = ('TkDefaultFont', 11, 'bold')
 
+    # Scale-slider keys whose UI direction should be flipped (left/right swap).
+    # The stored value range stays the same; only the slider widget's
+    # `from_` and `to` are exchanged so dragging feels physically inverted.
+    _REVERSED_SCALE_KEYS = {'p40_curl'}
+
     def __init__(self, node,
                  scale_magnitude_max=3.5, scale_res=0.1,
                  offset_min=-15.0, offset_max=15.0, offset_res=1.0,
@@ -765,6 +844,17 @@ class TuningSliders:
             width=18, fg='#a00', command=self._on_record_toggle,
         )
         self._rec_button.pack(side='left', padx=4)
+
+        # Hz input — glove pubs at 120 Hz max; setting lower decimates.
+        tk.Label(rec_row, text='Hz:', font=self._FONT_LABEL).pack(side='left', padx=(10, 2))
+        self._rec_hz_var = tk.IntVar(value=50)
+        self._rec_hz_spin = tk.Spinbox(
+            rec_row, from_=1, to=120, increment=1,
+            textvariable=self._rec_hz_var, width=5,
+            font=self._FONT_LABEL,
+        )
+        self._rec_hz_spin.pack(side='left', padx=2)
+
         self._rec_status_var = tk.StringVar(value='')
         tk.Label(rec_row, textvariable=self._rec_status_var,
                  font=self._FONT_LABEL, fg='#a00').pack(side='left', padx=4)
@@ -778,23 +868,32 @@ class TuningSliders:
         self._tick_rec_status()
 
     def _make_scale_slider(self, parent, key, label):
-        """Step 2 scale slider — range chosen by the default's sign so the sign
-        can never flip; only the magnitude moves."""
-        default = self.node.scales[key]
+        """Step 2 scale slider — sign range determined by the FACTORY default
+        (DEFAULT_SCALES), not the current value. If a previously-saved tuning
+        has the opposite sign for this key (because the factory sign was
+        changed later), its absolute value is taken so the slider can show it
+        in the new range."""
+        factory_default = self.node.DEFAULT_SCALES[key]
+        current = self.node.scales[key]
         mag = self.scale_magnitude_max
-        if default < 0:
+        if factory_default < 0:
             mn, mx = -mag, 0.0
+            if current > 0:
+                self.node.scales[key] = -current
         else:
             mn, mx = 0.0, mag
+            if current < 0:
+                self.node.scales[key] = -current
+        reverse = key in self._REVERSED_SCALE_KEYS
         self._make_slider(parent, self.node.scales, key, label,
-                          mn, mx, self.scale_res)
+                          mn, mx, self.scale_res, reverse=reverse)
 
     def _make_offset_slider(self, parent, key, label):
         """Step 3 offset slider — full bidirectional range."""
         self._make_slider(parent, self.node.offsets, key, label,
                           self.offset_min, self.offset_max, self.offset_res)
 
-    def _make_slider(self, parent, store, key, label, mn, mx, res):
+    def _make_slider(self, parent, store, key, label, mn, mx, res, reverse=False):
         tk = self.tk
         row = tk.Frame(parent)
         row.pack(fill='x', pady=2)
@@ -809,7 +908,10 @@ class TuningSliders:
             except (TypeError, ValueError):
                 pass
 
-        slider = tk.Scale(row, from_=mn, to=mx, resolution=res,
+        # Reversed slider: passing from_ > to to tk.Scale puts the high end
+        # on the left and the low end on the right — drag direction flips.
+        from_, to_ = (mx, mn) if reverse else (mn, mx)
+        slider = tk.Scale(row, from_=from_, to=to_, resolution=res,
                           orient='horizontal', variable=var,
                           length=self.slider_length,
                           showvalue=True, command=on_change,
@@ -843,18 +945,28 @@ class TuningSliders:
             path = self.node.stop_recording()
             self._rec_button.config(text='● Start Record', fg='#a00')
             if path is not None:
-                self._flash_status(f'Recording → {path.name}')
+                stats = self.node.last_record_stats or {}
+                n = stats.get('n', 0)
+                fps = stats.get('fps', 0.0)
+                self._flash_status(
+                    f'{n} frames @ {fps:.1f} Hz → {path.name}', ms=6000,
+                )
             else:
                 self._flash_status('Recording stopped (no frames).')
         else:
-            self.node.start_recording()
+            try:
+                hz = float(self._rec_hz_var.get())
+            except (ValueError, self.tk.TclError):
+                hz = 50.0
+            self.node.start_recording(target_hz=hz)
             self._rec_button.config(text='■ Stop Record', fg='#080')
 
     def _tick_rec_status(self):
         """Periodically refresh the recording status label (frame count)."""
         if self.node.recording:
             n = len(self.node.recorded_frames)
-            self._rec_status_var.set(f'REC  {n} frames')
+            target = getattr(self.node, '_rec_target_hz', 0.0)
+            self._rec_status_var.set(f'REC {n} frames  (target {target:.0f} Hz)')
         else:
             self._rec_status_var.set('')
         try:

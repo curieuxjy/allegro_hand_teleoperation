@@ -351,11 +351,13 @@ Learning-based approach using GeoRT (Geometric Retargeting) for improved accurac
 
 ### Workflow
 
-1. **Setup Environment** - Create conda environment with required dependencies
-2. **Log Hand Data** - Record human hand poses from glove sensors
-3. **Generate Robot Data** - Collect robot kinematic configurations
-4. **Train Model** - Learn geometric mapping between human and robot hands
-5. **Inference & Deployment** - Test and deploy to simulation/hardware
+1. **Setup Environment** — Create conda environment with required dependencies
+2. **Log Human Hand Data** — Record glove motion
+3. **Generate Robot Data** — Sample robot kinematics for the FK model + chamfer target
+   - **2b (optional)**: Generate self-collision dataset and train the collision classifier — required for the GeoRT collision-free criterion (`--w_collision > 0` during IK training)
+   - **2c (optional but recommended)**: Visual verification of URDF / config offsets / base frame
+4. **Train IK Model** — Learn geometric retargeting with chamfer + direction + curvature + pinch + (optionally) collision losses
+5. **Inference & Deployment** — Replay / real-time / hardware
 
 ---
 
@@ -365,9 +367,12 @@ Learning-based approach using GeoRT (Geometric Retargeting) for improved accurac
 
 - Ubuntu 22.04
 - ROS2 Humble
-- Allegro Hand V4
+- Robot hands: **Allegro Hand V4** (4 fingers, 16 DOF) and **v6_right** (5 fingers, 20 DOF). The pipeline is hand-agnostic — any URDF + JSON config under `glove_based/geort/config/` is supported.
 - Sapien Simulator 2.2.2
 - Python 3.10+
+
+> [!NOTE]
+> For 5-finger v6 the `--hand` flag accepts both `v6_right` and `v6_right.json`. v6's URDF includes a `virtual_base` link that re-aligns the wrist-mounted physical base to the GeoRT template convention (X = palm normal, Y = palm→thumb, Z = palm→middle finger) so chamfer matching against Manus mocap (which uses the same convention) works correctly. See `glove_based/assets/v6_right/v6_right.urdf` for the transform definition.
 
 **Installation**
 
@@ -435,25 +440,112 @@ python glove_based/geort_data_logger.py --name human1 --handness left --duration
 
 ### Step 2: Generate Robot Data
 
-Generate robot kinematics dataset for the Allegro hand configuration.
+Generate robot kinematics dataset (random qpos + fingertip 3D positions in base frame). This is the FK model's training data and the chamfer target distribution.
 
 ```bash
 conda activate geort
 
-# Standard: Generate 1M samples and save (recommended)
-python glove_based/geort/generate_robot_data.py --hand allegro_left
+# Allegro
+python glove_based/geort/generate_robot_data.py --hand allegro_right
+
+# v6 (5-finger)
+python glove_based/geort/generate_robot_data.py --hand v6_right.json
 
 # Optional: Visualize only (no dataset saved)
-python glove_based/geort/generate_robot_data.py --hand allegro_left --viz
+python glove_based/geort/generate_robot_data.py --hand v6_right.json --viz
 ```
 
 **Key Parameters:**
-- `--hand`: Hand config (`allegro_left` or `allegro_right`)
+- `--hand`: Hand config name (e.g., `allegro_right`, `v6_right.json`)
 - `--num-samples`: Number of samples (default: 1M for generation, 100 for viz)
-- `--viz`: Enable visualization mode
+- `--viz`: Enable visualization mode (slowed to 1s per pose by default)
 - `--no-save`: Preview mode (visualize without saving)
 
-**Output:** `glove_based/data/allegro_{left|right}.npz`
+**Output:** `glove_based/data/{hand_name}.npz`
+
+> [!IMPORTANT]
+> If you modify the URDF (e.g., change joint limits or add a virtual link), **regenerate** this dataset and delete `glove_based/checkpoint/fk_model_{hand}.pth` — otherwise the FK model becomes stale.
+
+---
+
+### Step 2b: Self-Collision Classifier (optional, required if `--w_collision > 0`)
+
+The IK loss can optionally include the **collision-free** criterion from the GeoRT paper (Criterion V):
+
+```
+L_col = -E_xH [ log(1 - sigmoid(C(f(xH)))) ]
+```
+
+`C` is a small MLP pretrained to predict `P(self-collision | qpos)`. trainer.py uses it as a **frozen, differentiable** proxy for the sapien-based collision check so the IK loss can avoid colliding poses without running PhysX per training batch.
+
+Only needed if you'll train with `--w_collision > 0` (recommended for hands where fingers pack tightly, e.g., v6's 5-finger layout).
+
+**2b.1 Generate collision dataset**
+
+```bash
+python glove_based/geort/collision_data.py --hand v6_right.json
+```
+
+For each random qpos, the script sets the articulation pose in sapien, steps the scene once (tiny dt, gravity off), and labels the sample collided/free based on whether any link pair penetrates by more than `--min_penetration` (default 2 mm, filters out sub-mm URDF mesh-design artifacts at joint boundaries).
+
+**Key parameters:**
+- `--hand`: Hand config name (must match URDF used by trainer.py)
+- `--n_samples`: Number of samples (default: 1,000,000)
+- `--min_penetration`: Penetration depth threshold in meters (default: 0.002)
+- `--strategy`: Sampling strategy. `balanced` (default) mixes single-joint perturbations, K-joint perturbations, and uniform random to give a ~50% collision rate — important for class balance during classifier training. Pure `random` typically yields ~80% collision (uniform random qpos is mostly in collision for tight-packed hands), which hurts the classifier.
+
+**Output:** `glove_based/data/{hand_name}_collision.npz` with `qpos` and `label`.
+
+The script prints collision rate at the end — aim for **20-60%** for a learnable classifier.
+
+**2b.2 Train the classifier**
+
+```bash
+python glove_based/geort/collision_classifier.py --hand v6_right.json
+```
+
+Trains a 3-layer MLP (input: normalized qpos in [-1, 1], output: 1 logit) with BCE loss and `pos_weight = n_neg/n_pos` for imbalance compensation. Prints per-epoch precision/recall/F1; saves the best-val model.
+
+**Output:** `glove_based/checkpoint/collision_classifier_{hand_name}.pth`
+
+> [!NOTE]
+> Whenever you change the URDF (especially joint limits), regenerate the collision dataset and retrain the classifier — otherwise the IK loss penalizes a stale collision boundary.
+
+---
+
+### Step 2c: Visual Verification Tools (optional but recommended)
+
+Before kicking off long training runs, verify that the URDF, config offsets, and base-frame convention are correct.
+
+**`hand_debug.py`** — multi-hand interactive viewer with RGB axis markers (anchored at config's `base_link`) and per-fingertip sphere markers (placed at `link.world * center_offset`, the exact point GeoRT learns):
+
+```bash
+# v6 alone — check axes are aligned with template convention, fingertip
+# markers sit on the actual mesh tips
+python glove_based/geort/env/hand_debug.py --hand v6_right --kinematic --pose zero
+
+# Side-by-side: v6 vs allegro for direct base-frame comparison
+python glove_based/geort/env/hand_debug.py --hand v6_right allegro_right --kinematic
+
+# Random cycling (default), physics enabled
+python glove_based/geort/env/hand_debug.py --hand v6_right
+```
+
+CLI flags:
+- `--hand <name> [<name> ...]`: load one or multiple configs into the same scene
+- `--kinematic`: snap qpos directly (recommended for verification — avoids PD wobble on dense hands)
+- `--pose {random, zero, mid}`: hold a static pose (default `random` cycles every 30 steps). `zero` = fully extended fingers, ideal for offset alignment checks.
+- Legacy: `--render-hand {left, right, both}` still maps to `allegro_left`/`allegro_right`.
+
+**`hand_static.py`** — random-colored static link viewer:
+
+```bash
+# Any configured hand (used for spotting which link is which / mesh layout)
+python glove_based/geort/env/hand_static.py --hand v6_right
+python glove_based/geort/env/hand_static.py --hand allegro_right
+```
+
+Axes are drawn at the config's `base_link` so v6's `virtual_base` is visible in its corrected orientation.
 
 ---
 
@@ -464,27 +556,31 @@ Train the geometric retargeting model using logged human data.
 **Basic Training**
 
 ```bash
-# Right hand
+# Allegro right
 python glove_based/geort/trainer.py \
     --hand allegro_right \
     --human_data human1_right_1028_150817.npy
 
-# Left hand
+# v6 (5-finger) with collision-aware loss and human-to-robot scale compensation
 python glove_based/geort/trainer.py \
-    --hand allegro_left \
-    --human_data human1_left_1028_150409.npy
+    --hand v6_right.json \
+    --human_data human3_right_0512_164829.npy \
+    --ckpt_tag v6_h3 \
+    --scale 0.8
 ```
 
 **Advanced Training**
 
 ```bash
 python glove_based/geort/trainer.py \
-    --hand allegro_right \
-    --human_data human1_right_1117_105023.npy \
-    --ckpt_tag "experiment_v1" \
-    --w_chamfer 80.0 \
-    --w_curvature 0.1 \
-    --w_pinch 1.0 \
+    --hand v6_right.json \
+    --human_data human3_right_0512_164829.npy \
+    --ckpt_tag experiment_v1 \
+    --w_chamfer 50 \
+    --w_curvature 1e5 \
+    --w_pinch 0.1 \
+    --w_collision 0.1 \
+    --scale 0.8 \
     --wandb_project my_geort_project \
     --wandb_entity my_username
 ```
@@ -492,14 +588,17 @@ python glove_based/geort/trainer.py \
 **Training Parameters:**
 
 *Required:*
-- `--hand`: Robot hand config (`allegro_left` or `allegro_right`)
+- `--hand`: Robot hand config name (e.g., `allegro_right`, `v6_right.json`)
 - `--human_data`: Human data filename (in `glove_based/data/`)
 
-*Optional Loss Weights:*
-- `--w_chamfer`: Chamfer loss weight (default: 80.0)
-- `--w_curvature`: Curvature loss weight (default: 0.1)
-- `--w_collision`: Collision loss weight (default: 0.0)
-- `--w_pinch`: Pinch loss weight (default: 1.0)
+*Loss Weights (defaults):* — direction loss has implicit weight 1.0. The other weights are tuned so direction stays relatively influential and Pinch doesn't dominate. Empirically this 1/10-of-paper scaling works better than paper values for this codebase due to differences in loss normalization (our pinch and chamfer formulas already include batch-size multipliers).
+- `--w_chamfer` (default `50`) — chamfer distance loss
+- `--w_curvature` (default `1e5`) — FK(IK) smoothness penalty
+- `--w_pinch` (default `0.1`) — pulls robot fingers together when human fingers are within 1.5 cm
+- `--w_collision` (default `0.1`) — pretrained collision classifier proxy (requires Step 2b checkpoint). Set to `0` to disable.
+
+*Human-Robot Scale Mismatch:*
+- `--scale` (default `1.0`) — scales human keypoints. Use when human-hand fingertip distance distribution doesn't match the robot's reachable workspace distribution. A quick diagnostic: compare `human_mean_dist / robot_mean_dist` from the kinematics dataset; the inverse is a good starting `--scale`. For v6 + adult-size Manus glove, `--scale 0.8` empirically works well (chamfer's "pull to dense robot region" doesn't fight human extended poses as much).
 
 *Wandb Configuration:*
 - `--wandb_project`: Project name (default: `geort`)
@@ -533,29 +632,38 @@ python glove_based/geort/trainer.py \
 
 Test trained model with pre-recorded human hand data in Sapien simulator.
 
-**Right Hand**
+**Allegro**
 
 ```bash
 python glove_based/geort_replay_evaluation.py \
-    --ckpt "human1_right_1028_150817_allegro_right_s10" \
+    --ckpt human1_right_1028_150817_allegro_right_s10 \
     --hand allegro_right \
     --data human1_right_1028_150817.npy
 ```
 
-**Left Hand**
+**v6 (recommended: `--kinematic` first for clean IK output verification)**
 
 ```bash
 python glove_based/geort_replay_evaluation.py \
-    --ckpt "human1_left_1028_150409_allegro_left_s10" \
-    --hand allegro_left \
-    --data human1_left_1028_150409.npy
+    --hand v6_right.json \
+    --ckpt v6_h3 \
+    --data human3_right_0512_164829.npy \
+    --kinematic
 ```
 
+`--ckpt` only needs a unique substring of the checkpoint directory name (no need for the full path or shell wildcards).
+
 **Parameters:**
-- `--ckpt`: Checkpoint tag for trained model
-- `--hand`: Hand configuration (`allegro_left` or `allegro_right`)
+- `--ckpt`: Substring matching the checkpoint directory under `glove_based/checkpoint/`
+- `--hand`: Hand configuration name
 - `--data`: Human data filename (in `glove_based/data/`)
-- `--use_last`: Load last checkpoint instead of best (optional, default: best)
+- `--use_last`: Load `last.pth` instead of `best.pth` (default: best)
+- `--kinematic`: Snap qpos directly each frame, no physics step. Use this to inspect the raw IK output — useful when physics-mode divergence obscures what the model actually predicts.
+- `--no_self_collision`: Physics on but filter intra-articulation contacts. Use when the hand collides with itself and PD oscillates (common with dense 5-finger hands).
+- `--kp` / `--kd` / `--force_limit`: PD tuning (defaults `400` / `40` / `10`). `kd=40` gives near-critical damping with `kp=400`. Lower `--kp 100 --kd 20` for softer/slower response when the IK target jumps fast.
+
+> [!TIP]
+> The viewer tints each link a distinct color (via `color_links` helper) so finger boundaries and self-collision contacts are easier to read visually.
 
 ---
 
@@ -576,22 +684,47 @@ python glove_based/manus_skeleton_21.py
 **Run Real-time Evaluation**
 
 ```bash
-# Terminal 3: Right hand
+# Terminal 3: Allegro right
 conda activate geort
 python glove_based/geort_realtime_evaluation.py \
-    --ckpt "human1_right_1028_150817_allegro_right_s10" \
+    --ckpt human1_right_1028_150817_allegro_right_s10 \
     --hand allegro_right
 
-# OR Left hand
+# v6, kinematic verification first (no physics)
 python glove_based/geort_realtime_evaluation.py \
-    --ckpt "human1_left_1028_150409_allegro_left_s10" \
-    --hand allegro_left
+    --hand v6_right.json \
+    --ckpt v6_h3 \
+    --kinematic
+
+# v6, physics on + record collision-resolved motion to disk
+python glove_based/geort_realtime_evaluation.py \
+    --hand v6_right.json \
+    --ckpt v6_h3 \
+    --kp 100 --kd 20 \
+    --record --record_name v6_h3_with_collision
 ```
 
 **Parameters:**
-- `--ckpt`: Checkpoint tag for trained model
-- `--hand`: Hand configuration (`allegro_left` or `allegro_right`)
-- `--use_last`: Load last checkpoint instead of best (optional, default: best)
+- `--ckpt`: Substring matching a checkpoint directory under `glove_based/checkpoint/`
+- `--hand`: Hand config name
+- `--use_last`: Load `last.pth` instead of `best.pth` (default: best)
+- `--kinematic`: Snap qpos directly each frame (no physics). Use for clean IK-output verification.
+- `--no_self_collision`: Physics on, intra-hand contacts filtered. Stabilizes hands prone to self-collision oscillation.
+- `--kp` / `--kd` / `--force_limit`: PD tuning (defaults `400` / `40` / `10`).
+- `--record`: Buffer per-frame motion and dump to `glove_based/data/<name>.npz` on shutdown (Ctrl+C).
+- `--record_name`: Output filename stem (default: `realtime_<hand>_<MMDD_HHMMSS>`).
+
+**Recorded `.npz` contents (when `--record`):**
+
+| Key | Shape | Meaning |
+|---|---|---|
+| `t` | (N,) float64 | wall-clock timestamp per frame |
+| `human_points` | (N, 21, 3) | preprocessed glove keypoints (Manus 21-node) |
+| `qpos_target` | (N, dof) | raw IK output |
+| `qpos_actual` | (N, dof) | qpos after physics resolution (collision pushback, PD damping) |
+| `meta` | (1,) object | run metadata: hand, ckpt, kp/kd/force_limit, `kinematic` flag, etc. |
+
+Under `--kinematic`, `qpos_target == qpos_actual` (snap is exact). Under physics mode, the *difference* is the value of this recording — it captures the collision-aware motion the IK alone wouldn't produce.
 
 ---
 

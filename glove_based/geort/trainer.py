@@ -35,7 +35,11 @@ from geort.env.hand import HandKinematicModel
 from geort.formatter import HandFormatter
 from geort.loss import chamfer_distance
 from geort.model import FKModel, IKModel
-from geort.collision_classifier import load_classifier as load_collision_classifier
+from geort.collision_classifier import (
+    CollisionClassifier,
+    CollisionDataset,
+    classifier_ckpt_path,
+)
 from geort.utils.config_utils import get_config, save_json
 from geort.utils.hand_utils import get_active_joints, get_active_joint_indices, get_entity_by_name
 from geort.utils.path import get_checkpoint_root, get_data_root, get_human_data
@@ -294,6 +298,132 @@ class GeoRTTrainer:
         return fk_model
 
     # ------------------------------------------------------------------------
+    # Collision Classifier (Criterion V)
+    # ------------------------------------------------------------------------
+
+    def get_collision_classifier_model(self, force_train=False):
+        """
+        Get or train the collision classifier (mirrors get_robot_neural_fk_model).
+
+        Loads `collision_classifier_{hand_name}.pth` from the checkpoint root if
+        present; otherwise trains from scratch using the dataset produced by
+        collision_data.py (data/{hand_name}_collision.npz) for COL_ITER epochs.
+
+        Returns the classifier in EVAL + FROZEN mode (gradients flow through it
+        into the IK network but its own parameters do not update). Returns None
+        if the collision dataset is missing or single-class — caller should
+        treat None as "collision loss unavailable".
+
+        Args:
+            force_train (bool): Force retraining even if checkpoint exists.
+
+        Returns:
+            CollisionClassifier (frozen, eval) or None
+        """
+        hand_name = self.config["name"]
+        ckpt_path = classifier_ckpt_path(hand_name)
+
+        # Normalizer & dof must match collision_classifier.py training spec
+        # because IK model output (Tanh, normalized [-1,1]) feeds straight in.
+        joint_lower_limit, joint_upper_limit = self.hand.get_joint_limit()
+        normalizer = HandFormatter(joint_lower_limit, joint_upper_limit)
+        dof = self.hand.get_n_dof()
+        hidden = 128
+
+        model = CollisionClassifier(dof=dof, hidden=hidden).cuda()
+
+        if ckpt_path.exists() and not force_train:
+            ckpt = torch.load(ckpt_path, map_location="cuda")
+            model.load_state_dict(ckpt["state_dict"])
+            print(f"[Collision] Loaded classifier checkpoint from {ckpt_path}")
+        else:
+            print("Train Collision Classifier (Criterion V) from Scratch")
+
+            data_path = Path(get_data_root()) / f"{hand_name}_collision.npz"
+            if not data_path.exists():
+                print(f"[Collision] Dataset missing at {data_path}.")
+                print(f"            Run: python glove_based/geort/collision_data.py "
+                      f"--hand {hand_name}.json")
+                return None
+
+            data = np.load(data_path)
+            qpos_all, label_all = data["qpos"], data["label"]
+            n = len(qpos_all)
+            pos_rate = float(label_all.mean())
+            print(f"  Loaded {n} samples (collision rate: {pos_rate * 100:.2f}%)")
+            if pos_rate == 0.0 or pos_rate == 1.0:
+                print("[Collision] Dataset is single-class; cannot train.")
+                return None
+
+            # train/val split (shuffled)
+            val_frac = 0.1
+            perm = np.random.permutation(n)
+            n_val = int(n * val_frac)
+            val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+            train_ds = CollisionDataset(qpos_all[train_idx], label_all[train_idx], normalizer)
+            val_ds = CollisionDataset(qpos_all[val_idx], label_all[val_idx], normalizer)
+            train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
+            val_loader = DataLoader(val_ds, batch_size=512, shuffle=False)
+
+            # BCE with pos_weight to compensate for class imbalance
+            n_pos = max(int(label_all.sum()), 1)
+            n_neg = max(n - n_pos, 1)
+            pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32).cuda()
+
+            criterion_col = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            col_optim = optim.Adam(model.parameters(), lr=1e-3)
+
+            best_val_loss = float("inf")
+            for epoch in range(COL_ITER):
+                # ----- train -----
+                model.train()
+                tr_losses = []
+                for qpos, label in train_loader:
+                    qpos = qpos.cuda()
+                    label = label.cuda()
+                    logit = model(qpos).squeeze(-1)
+                    loss = criterion_col(logit, label)
+                    col_optim.zero_grad()
+                    loss.backward()
+                    col_optim.step()
+                    tr_losses.append(loss.item())
+
+                # ----- val -----
+                model.eval()
+                va_losses = []
+                with torch.no_grad():
+                    for qpos, label in val_loader:
+                        qpos = qpos.cuda()
+                        label = label.cuda()
+                        logit = model(qpos).squeeze(-1)
+                        va_losses.append(criterion_col(logit, label).item())
+
+                tr_loss = float(np.mean(tr_losses))
+                va_loss = float(np.mean(va_losses))
+                print(f"Collision Classifier Epoch: {epoch}; "
+                      f"Train: {tr_loss:.4f}  Val: {va_loss:.4f}")
+
+                if self.logger:
+                    self.logger.log({
+                        "Collision/TrainLoss": tr_loss,
+                        "Collision/ValLoss": va_loss,
+                    })
+
+                # Best-by-val-loss checkpoint (matches collision_classifier.py)
+                if va_loss < best_val_loss:
+                    best_val_loss = va_loss
+                    torch.save({
+                        "state_dict": model.state_dict(),
+                        "config": {"dof": dof, "hidden": hidden, "hand": hand_name},
+                    }, ckpt_path)
+
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        return model
+
+    # ------------------------------------------------------------------------
     # Main Training Method
     # ------------------------------------------------------------------------
 
@@ -336,32 +466,48 @@ class GeoRTTrainer:
         normalize_losses = kwargs.get("normalize_losses", False)
         ema_alpha = kwargs.get("ema_alpha", 0.95)
 
-        # Models
-        fk_model = self.get_robot_neural_fk_model()
-        ik_model = IKModel(keypoint_joints=self.get_keypoint_info()["joint"]).cuda()
-        params = list(ik_model.parameters())
+        # Training pipeline:
+        #   Phase 1 — COL classifier (Criterion V): trained first, frozen below.
+        #   Phase 2 — Neural FK:                     trained second, frozen below.
+        #   Phase 3 — IK retargeting:                main loop; uses (frozen) FK
+        #                                            for embedded_point + (frozen)
+        #                                            COL for collision loss.
         os.makedirs(get_checkpoint_root(), exist_ok=True)
 
-        # Optional: pretrained collision classifier (frozen). Used only when
-        # --w_collision > 0. Gradients flow through it to ik_model but its
-        # own weights are not updated. See GeoRT paper, Criterion V.
+        # -------- Phase 1: Collision Classifier (Criterion V) ------------------
+        # Trained first so it can be reused as a frozen, differentiable proxy
+        # in Phase 3. Skipped entirely if --w_collision == 0.
+        print("\n" + "=" * 70)
+        print("Phase 1/3: Collision Classifier (Criterion V)")
+        print("=" * 70)
         w_collision_kw = kwargs.get("w_collision", 0.0)
         collision_classifier = None
         if w_collision_kw > 0.0:
-            collision_classifier = load_collision_classifier(self.config["name"], device="cuda")
+            collision_classifier = self.get_collision_classifier_model()
             if collision_classifier is None:
-                ckpt_hint = (Path(get_checkpoint_root()) /
-                             f"collision_classifier_{self.config['name']}.pth")
                 raise FileNotFoundError(
-                    f"--w_collision={w_collision_kw} requires a pretrained collision "
-                    f"classifier at {ckpt_hint}.\n"
-                    f"Generate the dataset and train the classifier first:\n"
-                    f"  python glove_based/geort/collision_data.py --hand {self.config['name']}.json\n"
-                    f"  python glove_based/geort/collision_classifier.py --hand {self.config['name']}.json"
+                    f"--w_collision={w_collision_kw} requires the collision dataset.\n"
+                    f"Generate it first:\n"
+                    f"  python glove_based/geort/collision_data.py --hand {self.config['name']}.json"
                 )
-            print("[Collision] Loaded frozen collision classifier — collision loss enabled.")
+            print("[Collision] Frozen collision classifier ready — collision loss enabled.")
+        else:
+            print("[Collision] Skipped (w_collision == 0).")
 
-        # Optimizer
+        # -------- Phase 2: Forward Kinematics (frozen during IK) ---------------
+        # FK must exist before IK loop because every IK loss term passes joint
+        # predictions through fk_model to get embedded keypoints.
+        print("\n" + "=" * 70)
+        print("Phase 2/3: Forward Kinematics (FK)")
+        print("=" * 70)
+        fk_model = self.get_robot_neural_fk_model()
+
+        # -------- Phase 3: Inverse Kinematics (main retargeting loop) ----------
+        print("\n" + "=" * 70)
+        print("Phase 3/3: Inverse Kinematics (IK) — main retargeting")
+        print("=" * 70)
+        ik_model = IKModel(keypoint_joints=self.get_keypoint_info()["joint"]).cuda()
+        params = list(ik_model.parameters())
         ik_optim = optim.AdamW(ik_model.parameters(), lr=1e-4)
 
         # Log configuration to wandb
@@ -410,6 +556,7 @@ class GeoRTTrainer:
             "MODEL_ID": time_stamp,
             "HUMAN_DATA": str(human_data_path),
             "FK_ITER": globals().get("FK_ITER"),
+            "COL_ITER": globals().get("COL_ITER"),
             "IK_ITER": globals().get("IK_ITER"),
             "HUMAN_POINT_DATASET_N": globals().get("HUMAN_POINT_DATASET_N"),
             "POINT_BATCH_SIZE": globals().get("POINT_BATCH_SIZE"),
@@ -863,6 +1010,9 @@ if __name__ == '__main__':
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
     FK_ITER = 250
+    COL_ITER = 150   # Collision classifier epochs (Criterion V) — only used when
+                    #   --w_collision > 0 AND no classifier checkpoint exists.
+                    #   Mirrors collision_classifier.py's --epochs default.
     IK_ITER = 1500 # 2500
     HUMAN_POINT_DATASET_N = 20000
     POINT_BATCH_SIZE = 4096

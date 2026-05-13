@@ -94,8 +94,8 @@ def main():
     )
     parser.add_argument("--hand", type=str, required=True,
                         help="Hand config name (e.g., v6_right.json)")
-    parser.add_argument("--n_samples", type=int, default=100000,
-                        help="Number of random qpos samples to label (default: 100000)")
+    parser.add_argument("--n_samples", type=int, default=1000000,
+                        help="Number of random qpos samples to label (default: 1000000)")
     parser.add_argument("--min_penetration", type=float, default=0.002,
                         help="Penetration depth (m) above which a contact counts as a "
                              "real self-collision; sub-threshold contacts are treated "

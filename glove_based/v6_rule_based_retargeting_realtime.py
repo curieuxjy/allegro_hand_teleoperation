@@ -26,7 +26,7 @@ CLI (Modbus options on top of the sim-only CLI)
   --modbus-tcp-port     TCP port                  (default 502)
   --modbus-slave-id     Modbus slave id           (default 1, auto-probed)
   --modbus-start-reg    starting holding register (default 0x10)
-  --modbus-hz           default send rate Hz      (default 100)
+  --modbus-hz           default send rate Hz      (default 120)
 """
 
 import sys
@@ -185,7 +185,7 @@ Examples:
                         default=rtu.V6ModbusClient.ADDRESS_CMD_POSITION,
                         help='Position command holding-register address '
                              '(default 0x10 = address_cmd_position).')
-    parser.add_argument('--modbus-hz', type=float, default=100.0,
+    parser.add_argument('--modbus-hz', type=float, default=120.0,
                         help='Default send rate (Hz). Adjustable from the slider window.')
 
     args = parser.parse_args()
@@ -275,7 +275,7 @@ Examples:
                 offset_min=-90.0, offset_max=90.0, offset_res=5.0,
                 slider_length=200,
                 with_load=True,
-                with_record=True, default_record_hz=50,
+                with_record=True, default_record_hz=120,
                 with_broadcast=True, default_broadcast_hz=args.modbus_hz,
                 title='V6 Retargeting Tuning (Realtime Modbus)',
             )

@@ -27,9 +27,7 @@ APH-specific bits:
 
 CLI (hardware options on top of the sim-only CLI)
   --no-publish        opt out of hardware publishing (sim/tune only)
-  --no-sign-flip      publish qpos as-is (sim convention) — useful for
-                      verifying on a sim-style /joint_states bridge
-  --publish-hz        default broadcast rate Hz (default 100)
+  --publish-hz        default broadcast rate Hz (default 120)
 """
 
 import sys
@@ -307,7 +305,7 @@ Examples:
     # Hardware output options
     parser.add_argument('--no-publish', action='store_false', dest='publish_enabled',
                         help='Disable ROS2 hardware publishing entirely.')
-    parser.add_argument('--publish-hz', type=float, default=100.0,
+    parser.add_argument('--publish-hz', type=float, default=120.0,
                         help='Default publish rate (Hz). Adjustable from the slider window.')
 
     args = parser.parse_args()
@@ -389,7 +387,7 @@ Examples:
                 offset_min=-90.0, offset_max=90.0, offset_res=5.0,
                 slider_length=200,
                 with_load=True,
-                with_record=True, default_record_hz=50,
+                with_record=True, default_record_hz=120,
                 with_broadcast=True, default_broadcast_hz=args.publish_hz,
                 title='aph Retargeting Tuning (Realtime ROS2)',
             )

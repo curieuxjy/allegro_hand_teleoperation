@@ -282,7 +282,8 @@ class ManusV6SimNode(Node):
         try:
             self.RECORDING_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-            path = self.RECORDING_DIR / f'motion_{ts}.txt'
+            hz_tag = f'{self._rec_target_hz:g}hz'
+            path = self.RECORDING_DIR / f'motion_{ts}_{hz_tag}.txt'
             with open(path, 'w') as f:
                 for frame in frames:
                     save_frame = frame.copy()
@@ -572,7 +573,7 @@ Examples:
                 scale_magnitude_max=3.5, scale_res=0.1,
                 offset_min=-90.0, offset_max=90.0, offset_res=5.0,
                 slider_length=200,
-                with_load=True, with_record=True, default_record_hz=50,
+                with_load=True, with_record=True, default_record_hz=120,
                 with_broadcast=False,
                 title='V6 Retargeting Tuning',
             )

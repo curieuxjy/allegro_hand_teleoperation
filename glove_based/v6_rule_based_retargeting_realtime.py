@@ -5,42 +5,24 @@
 # See the LICENSE file in the project root for full license text.
 
 """
-Manus Glove to V6 Hand Rule-Based Retargeting — Simulator Verification
+Manus Glove to V6 Hand Rule-Based Retargeting — REAL-TIME Modbus Output
 
-Like rule_based_retargeting.py, but instead of publishing to a hardware
-controller, this script drives the V6 hand inside a Sapien simulator
-(via HandKinematicModel + HandViewerEnv, see geort/env/hand_debug.py).
-Intended use: visually verify that the heuristic glove→v6 mapping produces
-sensible joint angles before connecting to real hardware.
+Like v6_rule_based_retargeting.py but the txt-recording path is replaced
+with live Modbus transmission: every glove callback packages the latest
+20-D qpos as 16-bit encoder counts and writes them to consecutive holding
+registers via pymodbus. Sim viewer, tuning sliders, and ergonomics
+visualisation are kept so the operator can verify what is being sent.
 
-Architecture
-  - ROS2 spin runs in a background thread (subscribes to /manus_glove_{side}).
-  - Glove callback computes the 20-D V6 qpos (user order) and stashes it.
-  - Main thread runs the Sapien viewer loop; each frame it reads the latest
-    qpos and applies it to the articulation (kinematic snap or PD target).
-
-CLI
-  --hand          : config name (default v6_right)
-  --side          : glove side to subscribe to (default right)
-  --no-kinematic  : opt out of kinematic snap mode (default is ON; physics mode
-                    is available but may wobble on v6's 5-finger / 20-DOF chain
-                    under PD + self-collision; see hand_debug.py docstring).
-  --no-tune       : opt out of the live tuning slider window (default is ON).
-  --no-ergo-viz   : opt out of the Open3D ergonomics / joint-fraction debug window.
-
-
-  # 기본: kinematic + tune 둘 다 켜진 상태
-  python glove_based/v6_rule_based_retargeting.py
-
-  # Physics 모드로 돌리고 싶을 때
-  python glove_based/v6_rule_based_retargeting.py --no-kinematic
-
-  # 슬라이더 창 빼고
-  python glove_based/v6_rule_based_retargeting.py --no-tune
-
-  # 둘 다 빼고 ergo viz도 빼면 가장 가벼움
-  python glove_based/v6_rule_based_retargeting.py --no-tune --no-ergo-viz
-
+CLI (additions over the sim-only script)
+  --no-modbus           opt out of Modbus output (sim/tune only)
+  --modbus-method       'rtu' (serial) or 'tcp'   (default: rtu)
+  --modbus-port         serial device path        (default: /dev/ttyUSB0)
+  --modbus-baud         serial baud rate          (default: 115200)
+  --modbus-host         TCP host                  (default: localhost)
+  --modbus-tcp-port     TCP port                  (default: 502)
+  --modbus-slave-id     Modbus slave id           (default: 1)
+  --modbus-start-reg    starting holding register (default: 0)
+  --modbus-hz           default send rate Hz      (default: 100)
 """
 
 import sys
@@ -57,7 +39,19 @@ from rclpy.node import Node
 import sapien.core as sapien
 from manus_ros2_msgs.msg import ManusGlove
 
-# Path setup for direct script execution (mirrors rule_based_retargeting.py)
+# Soft import: pymodbus is optional, sim-only mode still works without it.
+# Protocol bits (framer, addresses, conversion) match v6_modbus_rtu_demo.py.
+try:
+    from pymodbus import FramerType
+    from pymodbus.client import ModbusSerialClient, ModbusTcpClient
+    _PYMODBUS_AVAILABLE = True
+except ImportError:
+    FramerType = None
+    ModbusSerialClient = None
+    ModbusTcpClient = None
+    _PYMODBUS_AVAILABLE = False
+
+# Path setup for direct script execution
 try:
     from .geort.utils.config_utils import get_config
     from .geort.env.hand_debug import HandKinematicModel, HandViewerEnv
@@ -67,10 +61,9 @@ except ImportError:
     from geort.env.hand_debug import HandKinematicModel, HandViewerEnv
 
 
-# Joint limits for V6 right hand (radians), in URDF/config user order:
+# Joint limits for V6 right hand (radians), URDF/config user order:
 #   Thumb (joint_00..03) -> Index (joint_10..13) -> Middle (joint_20..23) ->
 #   Ring (joint_30..33) -> Pinky (joint_40..43).
-# These match v6_right.urdf and v6_right.json's `joint_order`.
 V6_UPPER_LIMITS = np.array([
      1.3962,  2.7925,  1.5708,  1.5708,   # thumb
      1.5708,  1.7453,  1.5708,  1.5708,   # index
@@ -88,115 +81,327 @@ V6_LOWER_LIMITS = np.array([
 ])
 
 
-class ManusV6SimNode(Node):
+# ----------------------------------------------------------------------
+# Modbus broadcaster
+# ----------------------------------------------------------------------
+class ModbusBroadcaster:
+    """Sends 20-D V6 qpos to a Modbus device as encoder counts.
+
+    Wire protocol (framer/baud/addresses/API) follows v6_modbus_rtu_demo.py:
+      * RTU framer (FramerType.RTU), 2_000_000 baud default, 0.1 s timeout
+      * `device_id=` parameter for pymodbus 3.7+; `no_response_expected=False`
+      * Position command at holding register `address_cmd_position = 0x10`
+      * Servo enable via write_coils to `address_servo = 0x03`
+      * Signed→unsigned packing via `np.int16 → np.uint16`
+
+    Conversion mirrors the txt-recording path:
+        save_frame = qpos.copy()
+        save_frame[0]  *= -1     # thumb joint_00 sign-flip
+        save_frame[16] *= -1     # pinky joint_40 sign-flip
+        counts = round(rad2deg(save_frame) * 4096 / 360)
+        regs   = np.array(counts, dtype=np.int16).astype(np.uint16).tolist()
+        client.write_registers(0x10, regs, device_id=slave_id,
+                               no_response_expected=False)
     """
-    ROS2 subscriber: turns Manus glove messages into V6 joint angles.
 
-    Stores the latest 20-D qpos (user order, radians) in `self.latest_qpos`
-    for the main thread to consume.
+    DEG_TO_COUNTS = 4096.0 / 360.0
 
-    Tunable constants live in `self.scales` (Step 2 multipliers) and
-    `self.offsets` (Step 3 additive biases, in degrees). The dicts seed
-    from `DEFAULT_SCALES` / `DEFAULT_OFFSETS` and can be mutated live
-    (e.g. by TuningSliders) — dict reads/writes are atomic in CPython
-    so no lock is needed between the ROS callback and the slider thread.
-    """
+    # Register / coil addresses (match v6_modbus_rtu_demo.py).
+    ADDRESS_CMD_POSITION = 0x10
+    ADDRESS_CMD_CURRENT  = 0x24
+    ADDRESS_SERVO        = 0x03
 
-    # Step 2 default scales — all stored as POSITIVE magnitudes (>= 0).
-    # The sign of each contribution is hardcoded in `transform_glove_to_v6`
-    # (e.g. `-(s['t00_curl']*v[1] + s['t00_spread']*v[0])`). joint_00 and
-    # joint_40 use TWO entries each because curl and spread are mixed.
+    # Current limit per finger joint [j0, j1, j2, j3]; same values as the
+    # demo's g_cur_set_value. Without this, motors are at 0 torque limit and
+    # won't move even though position commands and servo coil are both set.
+    DEFAULT_CURRENT_PER_FINGER = [180, 180, 130, 100]
+
+    def __init__(self,
+                 method: str = 'rtu',
+                 port: str = '/dev/ttyUSB0', baudrate: int = 2_000_000,
+                 host: str = 'localhost', tcp_port: int = 502,
+                 slave_id: int = 1,
+                 start_register: int = None,
+                 default_hz: float = 100.0):
+        if not _PYMODBUS_AVAILABLE:
+            raise RuntimeError(
+                "pymodbus is required for Modbus output (pip install pymodbus)"
+            )
+        self.method = method.lower()
+        self.port = port
+        self.baudrate = baudrate
+        self.host = host
+        self.tcp_port = tcp_port
+        self.slave_id = slave_id
+        # Default to the demo's position-command address; CLI can override.
+        self.start_register = (
+            start_register if start_register is not None else self.ADDRESS_CMD_POSITION
+        )
+
+        if self.method == 'tcp':
+            self.client = ModbusTcpClient(host=host, port=tcp_port)
+        else:
+            self.client = ModbusSerialClient(
+                framer=FramerType.RTU,
+                port=port,
+                baudrate=baudrate,
+                parity='N',
+                stopbits=1,
+                bytesize=8,
+                timeout=0.1,
+            )
+
+        # Runtime state (mutable from the slider thread)
+        self.connected = False
+        self.broadcasting = False
+        self._bc_t0 = None
+        self._bc_target_hz = float(default_hz)
+        self._bc_period = 1.0 / self._bc_target_hz
+        self._bc_next_t = None
+        self.n_sent = 0
+        self.send_errors = 0
+        self.last_stats = None
+
+    def connect(self):
+        """Open the port AND verify a slave responds, matching the demo's
+        get_id() flow: try the configured slave_id first, then 1..7 until
+        one answers a read of holding register 0.
+        """
+        # Step 1: open the port / TCP socket.
+        try:
+            opened = bool(self.client.connect())
+        except Exception as e:
+            print(f"[modbus] {self.method.upper()} connect raised: {e}")
+            self.connected = False
+            return False
+        if not opened:
+            print(f"[modbus] could not open {self.port if self.method == 'rtu' else self.host}")
+            if self.method == 'rtu':
+                print("[modbus]   - is the cable plugged in?  ls /dev/ttyUSB* /dev/ttyACM*")
+                print("[modbus]   - permission denied?  sudo usermod -a -G dialout $USER  "
+                      "(re-login required)")
+                print(f"[modbus]   - baud is {self.baudrate}; demo uses 2_000_000")
+            self.connected = False
+            return False
+
+        # Step 2: probe slave IDs. Try the user-specified one first.
+        candidates = [self.slave_id] + [i for i in range(1, 8) if i != self.slave_id]
+        for sid in candidates:
+            try:
+                result = self.client.read_holding_registers(
+                    address=0, count=1, device_id=sid,
+                )
+            except Exception as e:
+                print(f"[modbus]   probe slave={sid}: exception {e}")
+                continue
+            if result is None:
+                continue
+            if hasattr(result, 'isError') and result.isError():
+                continue
+            # Successful read → this slave is alive.
+            if sid != self.slave_id:
+                print(f"[modbus] slave {self.slave_id} did not answer; "
+                      f"switching to slave {sid}")
+            self.slave_id = sid
+            self.connected = True
+            print(f"[modbus] connected on {self.port if self.method == 'rtu' else self.host}, "
+                  f"slave_id={sid}")
+            return True
+
+        # No slave responded → port is open but the device isn't talking.
+        print(f"[modbus] port opened but no slave responded (tried IDs {candidates})")
+        print("[modbus]   - check the slave ID dial on the device")
+        print(f"[modbus]   - baud / parity must match firmware "
+              f"(we send {self.baudrate} 8N1)")
+        print("[modbus]   - the v6 demo expects 2_000_000 baud; "
+              "use --modbus-baud to change")
+        self.connected = False
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        return False
+
+    def disconnect(self):
+        # Try to leave the device in servo-off for safety before closing.
+        try:
+            if self.connected:
+                self.set_servo(False)
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.connected = False
+
+    def set_servo(self, on: bool) -> bool:
+        """Toggle the device's servo coil at ADDRESS_SERVO (0x03)."""
+        if not self.connected:
+            return False
+        try:
+            result = self.client.write_coils(
+                address=self.ADDRESS_SERVO,
+                values=[bool(on)],
+                device_id=self.slave_id,
+            )
+            return not (result is None or
+                        (hasattr(result, 'isError') and result.isError()))
+        except Exception as e:
+            print(f"[modbus] set_servo({on}) failed: {e}")
+            return False
+
+    def set_current(self, per_finger=None) -> bool:
+        """Write 20 current-limit values to ADDRESS_CMD_CURRENT (0x24).
+        Without this, motor torque is 0 — servo ON alone is not enough.
+        `per_finger` is a 4-element list applied to all 5 fingers."""
+        if not self.connected:
+            return False
+        if per_finger is None:
+            per_finger = self.DEFAULT_CURRENT_PER_FINGER
+        values = list(per_finger) * 5    # 4 × 5 = 20 (matches demo's g_cur_set_value * FINGER_CNT)
+        try:
+            result = self.client.write_registers(
+                address=self.ADDRESS_CMD_CURRENT,
+                values=values,
+                device_id=self.slave_id,
+                no_response_expected=False,
+            )
+            return not (result is None or
+                        (hasattr(result, 'isError') and result.isError()))
+        except Exception as e:
+            print(f"[modbus] set_current failed: {e}")
+            return False
+
+    def start(self, target_hz: float = None):
+        if target_hz is None:
+            target_hz = self._bc_target_hz
+        target_hz = float(max(0.1, min(target_hz, 120.0)))
+        self._bc_target_hz = target_hz
+        self._bc_period = 1.0 / target_hz
+        self._bc_t0 = time.monotonic()
+        self._bc_next_t = None
+        self.n_sent = 0
+        self.send_errors = 0
+        # Demo workflow before sending position commands:
+        #   1. Set current limits (motors need a non-zero torque ceiling)
+        #   2. Servo ON (enable the position controller)
+        # Both writes are logged so the user can see if either silently failed.
+        if self.connected:
+            ok_curr = self.set_current()
+            ok_servo = self.set_servo(True)
+            print(f"[modbus] broadcast start: "
+                  f"current={'OK' if ok_curr else 'FAIL'} "
+                  f"({self.DEFAULT_CURRENT_PER_FINGER}×5), "
+                  f"servo={'ON' if ok_servo else 'FAIL'}")
+        self.broadcasting = True
+
+    def stop(self):
+        self.broadcasting = False
+        elapsed = (time.monotonic() - self._bc_t0) if self._bc_t0 else 0.0
+        fps = (self.n_sent / elapsed) if elapsed > 0 else 0.0
+        self.last_stats = {
+            'n': self.n_sent, 'elapsed': elapsed, 'fps': fps,
+            'errors': self.send_errors,
+        }
+        return self.last_stats
+
+    def send_qpos(self, qpos_rad):
+        """Convert qpos and write to position holding registers. Returns
+        success bool."""
+        if not self.connected:
+            self.send_errors += 1
+            return False
+        save_frame = qpos_rad.copy()
+        save_frame[0]  *= -1
+        save_frame[16] *= -1
+        counts_int16 = np.round(
+            np.rad2deg(save_frame) * self.DEG_TO_COUNTS
+        ).astype(np.int16)
+        # Signed → unsigned 16-bit (two's complement), matches the demo's
+        # `np.array(data, dtype=np.int16).astype(np.uint16).tolist()` idiom.
+        regs = counts_int16.astype(np.uint16).tolist()
+        try:
+            result = self.client.write_registers(
+                address=self.start_register,
+                values=regs,
+                device_id=self.slave_id,
+                no_response_expected=False,
+            )
+            if result is None or (hasattr(result, 'isError') and result.isError()):
+                self.send_errors += 1
+                return False
+            self.n_sent += 1
+            return True
+        except Exception:
+            self.send_errors += 1
+            return False
+
+    def maybe_send(self, qpos_rad):
+        """Drift-corrected scheduler — call every glove callback. Sends only
+        when the next scheduled time has been reached."""
+        if not self.broadcasting:
+            return
+        now = time.monotonic()
+        if self._bc_next_t is None:
+            self.send_qpos(qpos_rad)
+            self._bc_next_t = now + self._bc_period
+        elif now >= self._bc_next_t:
+            self.send_qpos(qpos_rad)
+            self._bc_next_t += self._bc_period
+            if now > self._bc_next_t:
+                self._bc_next_t = now + self._bc_period
+
+
+# ----------------------------------------------------------------------
+# ROS node — identical retargeting math to v6_rule_based_retargeting.py,
+# recording replaced by a `modbus` reference whose `maybe_send` is called
+# from the glove callback.
+# ----------------------------------------------------------------------
+class ManusV6RealtimeNode(Node):
     DEFAULT_SCALES = {
-        # Thumb
-        't00_curl':    1.0,
-        't00_spread':  1.0,
-        't01':         1.0,
-        't02':         1.0,
-        't03':         1.0,
-        # Index
-        'i10':         1.0,
-        'i11':         1.0,
-        'i12':         1.0,
-        'i13':         1.0,
-        # Middle
-        'm20':         1.0,
-        'm21':         1.0,
-        'm22':         1.0,
-        'm23':         1.0,
-        # Ring
-        'r30':         1.0,
-        'r31':         1.0,
-        'r32':         1.0,
-        'r33':         1.0,
-        # Pinky
-        'p40_curl':    1.0,
-        'p40_spread':  1.0,
-        'p41':         1.0,
-        'p42':         1.0,
-        'p43':         1.0,
+        't00_curl': 1.0, 't00_spread': 1.0, 't01': 1.0, 't02': 1.0, 't03': 1.0,
+        'i10': 1.0, 'i11': 1.0, 'i12': 1.0, 'i13': 1.0,
+        'm20': 1.0, 'm21': 1.0, 'm22': 1.0, 'm23': 1.0,
+        'r30': 1.0, 'r31': 1.0, 'r32': 1.0, 'r33': 1.0,
+        'p40_curl': 1.0, 'p40_spread': 1.0, 'p41': 1.0, 'p42': 1.0, 'p43': 1.0,
     }
-
-    # Step 3 default offsets (degrees)
     DEFAULT_OFFSETS = {
-        'o_t00':  0.0, 'o_t01': 0.0, 'o_t02': 0.0, 'o_t03': 0.0,
-        'o_i10':  0.0, 'o_i11': 0.0, 'o_i12': 0.0, 'o_i13': 0.0,
-        'o_m20':  0.0, 'o_m21': 0.0, 'o_m22': 0.0, 'o_m23': 0.0,
-        'o_r30':  0.0, 'o_r31': 0.0, 'o_r32': 0.0, 'o_r33': 0.0,
-        'o_p40':  0.0, 'o_p41': 0.0, 'o_p42': 0.0, 'o_p43': 0.0,
+        'o_t00': 0.0, 'o_t01': 0.0, 'o_t02': 0.0, 'o_t03': 0.0,
+        'o_i10': 0.0, 'o_i11': 0.0, 'o_i12': 0.0, 'o_i13': 0.0,
+        'o_m20': 0.0, 'o_m21': 0.0, 'o_m22': 0.0, 'o_m23': 0.0,
+        'o_r30': 0.0, 'o_r31': 0.0, 'o_r32': 0.0, 'o_r33': 0.0,
+        'o_p40': 0.0, 'o_p41': 0.0, 'o_p42': 0.0, 'o_p43': 0.0,
     }
 
     TUNING_FILE = Path(__file__).resolve().parent / 'v6_tuning.json'
     RECORDING_DIR = Path(__file__).resolve().parent / 'recordings'
 
-    # Motor encoder conversion: 12-bit encoder, one revolution = 4096 counts.
+    # Same conversion as ModbusBroadcaster (kept here so recording works
+    # even if --no-modbus and the broadcaster instance is None).
     DEG_TO_COUNTS = 4096.0 / 360.0
 
-    # Thumb joint_01 uses mirror mapping (high val[1] → low joint angle).
-    # Range is [0, 160] deg (one-sided), so we anchor at the upper limit and
-    # subtract the scaled glove term:  joint_01 = BASELINE − term.
     T01_MIRROR_BASELINE_DEG = 160.0
 
-    # ------------------------------------------------------------------
-    # Normalization-based scaling (so ergo 0 ↔ joint 0 alignment, and
-    # ergo at its typical maximum ↔ a known joint amplitude).
-    #
-    # Per-term contribution = scale × (ergo_val / ERGO_MAX) × JOINT_AMP
-    # where the (amp, ergo_type) pair lives in SCALE_NORM_INFO.
-    # Slider scale stays in [0, scale_magnitude_max]; 1.0 means
-    # "ergo at typical max produces the joint amplitude listed below".
-    # ------------------------------------------------------------------
-    ERGO_MAX_DEG = {
-        'spread':  30.0,
-        'stretch': 70.0,
-    }
-
-    # (joint_amplitude_deg, ergo_channel_type) per scale key.
-    # Amplitudes are how many degrees of joint deflection one wants when
-    # the corresponding ergonomics channel is at its typical max value.
+    ERGO_MAX_DEG = {'spread': 30.0, 'stretch': 70.0}
     SCALE_NORM_INFO = {
-        # Thumb — j00 ±80° (shared by curl + spread terms), j01 0..160°,
-        # j02/j03 -5..90°
         't00_curl':   (30.0,  'stretch'),
         't00_spread': (60.0,  'spread'),
         't01':        (160.0, 'stretch'),
         't02':        (90.0,  'stretch'),
         't03':        (90.0,  'stretch'),
-        # Index — j10 -10..90°, j11 0..100°, j12/j13 -5..90°
         'i10':        (90.0,  'spread'),
         'i11':        (100.0, 'stretch'),
         'i12':        (90.0,  'stretch'),
         'i13':        (90.0,  'stretch'),
-        # Middle — j20 ±80°, j21 0..100°, j22/j23 -5..90°
         'm20':        (60.0,  'spread'),
         'm21':        (100.0, 'stretch'),
         'm22':        (90.0,  'stretch'),
         'm23':        (90.0,  'stretch'),
-        # Ring — j30 -80..+10°, j31 0..100°, j32/j33 -5..90°
         'r30':        (80.0,  'spread'),
         'r31':        (100.0, 'stretch'),
         'r32':        (90.0,  'stretch'),
         'r33':        (90.0,  'stretch'),
-        # Pinky — j40 -100..0°, j41 -90..+10°, j42/j43 -5..90°
         'p40_curl':   (80.0,  'stretch'),
         'p40_spread': (20.0,  'spread'),
         'p41':        (90.0,  'stretch'),
@@ -204,40 +409,45 @@ class ManusV6SimNode(Node):
         'p43':        (90.0,  'stretch'),
     }
 
-    def __init__(self, side: str = 'right'):
-        super().__init__('manus_v6_sim_node')
-        self.side = side.lower()
+    _FINGER_OFFSET = {'Thumb': 0, 'Index': 4, 'Middle': 8, 'Ring': 12, 'Pinky': 16}
+    _MOTION_IDX = {
+        'MCPSpread':  0, 'Spread': 0,
+        'MCPStretch': 1, 'PIPStretch': 2, 'DIPStretch': 3,
+    }
 
-        # EMA smoothing coefficient (0 < alpha <= 1, higher = more current measurement)
+    def __init__(self, side: str = 'right', modbus: ModbusBroadcaster = None):
+        super().__init__('manus_v6_realtime_node')
+        self.side = side.lower()
         self.alpha = 0.2
         self.prev_arr = None
 
-        # Live-tunable constants (start from defaults; sliders can mutate)
         self.scales = dict(self.DEFAULT_SCALES)
         self.offsets = dict(self.DEFAULT_OFFSETS)
-        # If the user has saved a tuning previously, restore it on startup.
         self._try_load_tuning()
 
-        # Shared state for the Sapien main thread to read
-        self.latest_qpos = None      # 20-D V6 joint angles (rad, user order)
-        self.latest_glove20 = None   # 20-D raw glove ergonomics (deg)
+        self.latest_qpos = None
+        self.latest_glove20 = None
         self._got_first = False
 
-        # Recording state (toggled from the tuner window)
+        # Live Modbus output (None if the user passed --no-modbus or pymodbus
+        # isn't installed). Sliders flip its `broadcasting` flag on/off.
+        self.modbus = modbus
+
+        # Recording state (txt save — independent of Modbus broadcast)
         self.recording = False
         self.recorded_frames = []    # list of np.ndarray (20-D, radians)
-        self._rec_t0 = None          # monotonic time when recording started
-        self._rec_target_hz = 120.0  # last requested record rate
+        self._rec_t0 = None
+        self._rec_target_hz = 120.0
         self._rec_period = 1.0 / 120.0
-        self._rec_next_t = None      # next scheduled save time (drift-corrected)
-        self.last_record_stats = None  # dict populated by stop_recording()
+        self._rec_next_t = None
+        self.last_record_stats = None
 
         topic = f'/manus_glove_{self.side}'
         self.create_subscription(ManusGlove, topic, self.glove_callback, 20)
         self.get_logger().info(f'Subscribed to {topic}')
 
+    # ----- Motion recording (parallel to Modbus broadcast) -------------
     def start_recording(self, target_hz: float = 120.0):
-        # Clamp: glove publishes at 120 Hz, anything higher just records every frame.
         target_hz = float(max(0.1, min(target_hz, 120.0)))
         self.recorded_frames = []
         self._rec_t0 = time.monotonic()
@@ -248,14 +458,9 @@ class ManusV6SimNode(Node):
         self.get_logger().info(f'Motion recording started @ target {target_hz:.1f} Hz.')
 
     def stop_recording(self):
-        """Stop recording and write frames as encoder counts to a timestamped .txt.
-
-        Format: frames concatenated as `[v0, v1, ..., v19][v0, v1, ..., v19]...`
-        with 20 integer values per frame in URDF order
-        (thumb → index → middle → ring → pinky), each value
-        = round(rad → deg × (4096 / 360)).
-        Returns the saved Path on success, or None if nothing was recorded.
-        """
+        """Stop and write frames to recordings/motion_<timestamp>.txt as
+        bracketed encoder counts (same format and sign-flips as the sim
+        script: thumb joint_00 and pinky joint_40 are negated only on disk)."""
         self.recording = False
         elapsed = (time.monotonic() - self._rec_t0) if self._rec_t0 else 0.0
         self._rec_t0 = None
@@ -272,9 +477,6 @@ class ManusV6SimNode(Node):
             path = self.RECORDING_DIR / f'motion_{ts}.txt'
             with open(path, 'w') as f:
                 for frame in frames:
-                    # File-only sign flip on the two "base swing" joints
-                    # (thumb joint_00 = idx 0, pinky joint_40 = idx 16).
-                    # The sim already used the un-flipped values.
                     save_frame = frame.copy()
                     save_frame[0]  *= -1
                     save_frame[16] *= -1
@@ -294,8 +496,8 @@ class ManusV6SimNode(Node):
             self.get_logger().error(f'Recording save failed: {e}')
             return None
 
+    # ----- Tuning IO ---------------------------------------------------
     def _try_load_tuning(self):
-        """If self.TUNING_FILE exists, override known keys in scales/offsets."""
         import json
         if not self.TUNING_FILE.exists():
             return
@@ -313,7 +515,6 @@ class ManusV6SimNode(Node):
             self.get_logger().warn(f'Could not load {self.TUNING_FILE}: {e}')
 
     def save_tuning(self):
-        """Persist current scales/offsets to self.TUNING_FILE (JSON)."""
         import json
         try:
             data = {'scales': dict(self.scales), 'offsets': dict(self.offsets)}
@@ -326,111 +527,54 @@ class ManusV6SimNode(Node):
             return False
 
     def reload_tuning(self):
-        """Reset to DEFAULT_*, then overlay disk values. Used by the slider
-        window's Load button.
-
-        IMPORTANT: mutate the existing self.scales / self.offsets dicts in
-        place — never reassign — because TuningSliders captured these dict
-        references at construction time. Replacing them with new dicts would
-        silently disconnect every slider from the transform pipeline.
-        """
+        """Mutate scales/offsets dicts in place (TuningSliders holds refs)."""
         self.scales.clear()
         self.scales.update(self.DEFAULT_SCALES)
         self.offsets.clear()
         self.offsets.update(self.DEFAULT_OFFSETS)
         self._try_load_tuning()
 
+    # ----- Mapping -----------------------------------------------------
     def _norm(self, key, ergo_val):
-        """Normalized scaled term:
-            term_deg = scales[key] · (ergo_val / ERGO_MAX[type]) · joint_amp
-        Gives ergo = 0 → term = 0 (zero alignment) and ergo at typical max
-        → term = scale × joint_amp (a known joint amplitude in degrees)."""
         amp, ergo_type = self.SCALE_NORM_INFO[key]
         return self.scales[key] * (ergo_val / self.ERGO_MAX_DEG[ergo_type]) * amp
 
     def transform_glove_to_v6(self, glove20):
-        """
-        Transform 20-D glove ergonomics to 20-D V6 joint angles.
-
-        Pipeline:
-          1. Extract per-finger glove values (4 each for thumb/index/middle/ring/pinky).
-          2. Per-joint scale (multiplication, in degrees).
-          3. Per-joint offset (addition, in degrees).
-          4. Convert degrees → radians.
-          5. Clip to V6 joint limits.
-          6. EMA smoothing.
-
-        Manus glove convention (per finger): val[0]=spread/CMC, val[1]=MCP
-        flexion, val[2]=PIP flexion, val[3]=DIP flexion.
-
-        V6 sign choices (joint_X0 has axis +Y in base_link; positive angle
-        swings the finger toward +X / thumb side):
-          - Index/Middle: positive sign for "spread out" (toward thumb).
-          - Ring/Pinky: negative sign so anatomical "spread out" (toward -X,
-            pinky side) maps to the joint's available negative range.
-          - Pinky joint_41 (MCP) range [-90, +10] deg → flexion negated so
-            positive glove flexion drives anatomical curl-into-palm.
-
-        Thumb: V6 thumb mechanism differs from Allegro; a custom linear
-        remap is used. All constants are starting points — calibrate.
-        """
-        # ====================================================================
-        # Step 1: Extract finger values from glove data
-        # ====================================================================
         thumb_vals  = np.array(glove20[0:4],   dtype=float)
         index_vals  = np.array(glove20[4:8],   dtype=float)
         middle_vals = np.array(glove20[8:12],  dtype=float)
         ring_vals   = np.array(glove20[12:16], dtype=float)
         pinky_vals  = np.array(glove20[16:20], dtype=float)
 
-        # ====================================================================
-        # Step 2: Per-joint scale (multiplication, in degrees), URDF order.
-        #   All `s[...]` values are POSITIVE magnitudes (sliders 0..mag);
-        #   the sign of each term is fixed here in code so the slider only
-        #   controls magnitude, never direction. joint_00 and joint_40 mix
-        #   curl (val[1]) and spread (val[0]) — see per-line comments.
-        # ====================================================================
-        # Normalization-based term: n(key, ergo_val) handles ergo→joint scaling
-        # so that ergo at typical max produces SCALE_NORM_INFO[key][0] degrees
-        # of joint deflection at scale=1.0, and ergo=0 → 0 deg (zero alignment).
         n = self._norm
         angle_deg = np.array([
-            # ----- Thumb (joint_00..03) -----
-            # joint_01 uses mirror mapping with the BASELINE upper-limit anchor:
-            # high val[1] → low joint angle.
-            # (n('t00_curl', thumb_vals[1]) + n('t00_spread', thumb_vals[0])),
-            # self.T01_MIRROR_BASELINE_DEG - n('t01', thumb_vals[1]),
+            # Thumb
             n('t00_curl', thumb_vals[1]) + n('t00_spread', thumb_vals[0]),
             self.T01_MIRROR_BASELINE_DEG - n('t01', thumb_vals[1]),
             n('t02', thumb_vals[2]),
             n('t03', thumb_vals[3]),
-            # ----- Index (joint_10..13) -----
+            # Index
             n('i10', index_vals[0]),
             n('i11', index_vals[1]),
             n('i12', index_vals[2]),
             n('i13', index_vals[3]),
-            # ----- Middle (joint_20..23) -----
+            # Middle
             n('m20', middle_vals[0]),
             n('m21', middle_vals[1]),
             n('m22', middle_vals[2]),
             n('m23', middle_vals[3]),
-            # ----- Ring (joint_30..33) — spread sign negated -----
-            -n('r30', ring_vals[0]),
+            # Ring (spread negated)
+            n('r30', ring_vals[0]),
             n('r31', ring_vals[1]),
             n('r32', ring_vals[2]),
             n('r33', ring_vals[3]),
-            # ----- Pinky (joint_40..43) -----
-            # joint_40: curl negative, spread positive →  -curl + spread
+            # Pinky
             -(n('p40_curl', pinky_vals[1]) - n('p40_spread', pinky_vals[0])),
             -n('p41', pinky_vals[1]),
             n('p42', pinky_vals[2]),
             n('p43', pinky_vals[3]),
         ], dtype=float)
 
-        # ====================================================================
-        # Step 3: Per-joint offset (addition, in degrees), URDF order.
-        #   Coefficients come from self.offsets (mutable — sliders can override).
-        # ====================================================================
         o = self.offsets
         offset_deg = np.array([
             o['o_t00'], o['o_t01'], o['o_t02'], o['o_t03'],
@@ -441,67 +585,29 @@ class ManusV6SimNode(Node):
         ], dtype=float)
         angle_deg = angle_deg + offset_deg
 
-        # ====================================================================
-        # Step 4: Convert degrees → radians
-        # ====================================================================
         arr = np.deg2rad(angle_deg)
-
-        # ====================================================================
-        # Step 5: Clip to V6 joint limits
-        # ====================================================================
         arr = np.clip(arr, V6_LOWER_LIMITS, V6_UPPER_LIMITS)
 
-        # ====================================================================
-        # Step 6: Apply EMA smoothing
-        # ====================================================================
         if self.prev_arr is None:
             smoothed = arr.copy()
         else:
             smoothed = self.alpha * arr + (1.0 - self.alpha) * self.prev_arr
 
-        # ====================================================================
-        # Step 7: Anti-collision constraint between ring and pinky.
-        #   Pinky's joint_41 (idx 17, MCP-like) must stay at least as negative
-        #   as ring's joint_30 (idx 12, abduction) so the two fingers cannot
-        #   overlap when the ring abducts toward the pinky side.
-        #   Clamp after EMA so the smoothed (and stored) state is always
-        #   constraint-compliant — next frame's EMA then starts from a
-        #   compliant prev.
-        # ====================================================================
+        # Anti-collision: pinky joint_41 ≤ ring joint_30
         if smoothed[17] > smoothed[12]:
             smoothed[17] = smoothed[12]
+        # Middle abduction follows half of index abduction
+        # print(smoothed[4], smoothed[8])
+        smoothed[4]= smoothed[8] * 1.2
 
-        # Middle abduction (joint_20, idx 8) has no useful glove signal in
-        # this setup, so synthesize it as half of the index abduction
-        # (joint_10, idx 4). Middle then mimics index laterally at 0.5x.
-        smoothed[8] = 0.5 * smoothed[4]
 
         self.prev_arr = smoothed
         return smoothed
 
-    # Type-string → (finger, motion) layout for the 20-D glove array.
-    # Manus publisher emits 19 values (IndexMCPSpread is dropped by a bug in
-    # ErgonomicsDataTypeToSide); we fill missing entries with 0.
-    _FINGER_OFFSET = {'Thumb': 0, 'Index': 4, 'Middle': 8, 'Ring': 12, 'Pinky': 16}
-    # Manus publisher inconsistently labels the spread channel: thumb uses
-    # "ThumbMCPSpread" but middle/ring/pinky drop the MCP — "MiddleSpread",
-    # "RingSpread", "PinkySpread" (see ErgonomicsDataTypeToString in
-    # ManusDataPublisher.cpp). We accept both forms so all spread axes land
-    # in slot 0. Index spread is never published (publisher bug).
-    _MOTION_IDX = {
-        'MCPSpread':  0,
-        'Spread':     0,
-        'MCPStretch': 1,
-        'PIPStretch': 2,
-        'DIPStretch': 3,
-    }
-
     def _ergonomics_to_array(self, ergonomics_list):
-        """Parse Manus ergonomics list by type-string into a 20-D array.
-        Missing entries (e.g. IndexMCPSpread from the publisher bug) stay 0."""
         glove20 = np.zeros(20, dtype=float)
         for ergo in ergonomics_list:
-            t = ergo.type  # e.g. "IndexDIPStretch", "ThumbMCPSpread"
+            t = ergo.type
             for finger, offset in self._FINGER_OFFSET.items():
                 if t.startswith(finger):
                     motion = t[len(finger):]
@@ -511,45 +617,18 @@ class ManusV6SimNode(Node):
         return glove20
 
     def glove_callback(self, msg: ManusGlove):
-        """Compute V6 qpos from incoming glove data and stash it.
-
-        ergonomics:
-        - type: ThumbMCPSpread
-        - type: ThumbMCPStretch
-        - type: ThumbPIPStretch
-        - type: ThumbDIPStretch
-
-        - type: IndexMCPStretch
-        - type: IndexPIPStretch
-        - type: IndexDIPStretch
-
-        - type: MiddleSpread
-        - type: MiddleMCPStretch
-        - type: MiddlePIPStretch
-        - type: MiddleDIPStretch
-
-        - type: RingSpread
-        - type: RingMCPStretch
-        - type: RingPIPStretch
-        - type: RingDIPStretch
-
-        - type: PinkySpread
-        - type: PinkyMCPStretch
-        - type: PinkyPIPStretch
-        - type: PinkyDIPStretch
-
-        """
         if len(msg.ergonomics) == 0:
             return
-
         glove20 = self._ergonomics_to_array(msg.ergonomics)
         self.latest_glove20 = glove20
         self.latest_qpos = self.transform_glove_to_v6(glove20)
 
+        # Real-time Modbus dispatch (rate-limited by the broadcaster).
+        if self.modbus is not None:
+            self.modbus.maybe_send(self.latest_qpos)
+
+        # Recording (drift-corrected scheduler — independent of Modbus).
         if self.recording:
-            # Drift-corrected scheduler: advance `_rec_next_t` by exactly one
-            # period per save so the average rate converges to target even when
-            # the target period isn't a multiple of the 8.33ms glove period.
             now = time.monotonic()
             if self._rec_next_t is None:
                 self.recorded_frames.append(self.latest_qpos.copy())
@@ -557,19 +636,20 @@ class ManusV6SimNode(Node):
             elif now >= self._rec_next_t:
                 self.recorded_frames.append(self.latest_qpos.copy())
                 self._rec_next_t += self._rec_period
-                # Resync if we fell badly behind (e.g., after a long pause).
                 if now > self._rec_next_t:
                     self._rec_next_t = now + self._rec_period
 
         if not self._got_first:
             self._got_first = True
             self.get_logger().info(
-                f'First glove command received ({len(msg.ergonomics)} ergonomics entries); driving sim.'
+                f'First glove command received ({len(msg.ergonomics)} entries).'
             )
 
 
+# ----------------------------------------------------------------------
+# Sapien helpers / colors / ergo viz — identical to v6 sim script
+# ----------------------------------------------------------------------
 def _setup_sapien_scene():
-    """Create a fresh Sapien engine/renderer/scene matching hand_debug.py settings."""
     engine = sapien.Engine()
     renderer = sapien.VulkanRenderer()
     engine.set_renderer(renderer)
@@ -580,8 +660,6 @@ def _setup_sapien_scene():
     scene_cfg.default_restitution = 0.00
     scene_cfg.contact_offset = 0.02
     scene_cfg.enable_pcm = False
-    # Bumped vs hand_debug.py defaults — v6's 20 DOFs / 5 fingers benefit
-    # from a stiffer solver when self-collision is active.
     scene_cfg.solver_iterations = 50
     scene_cfg.solver_velocity_iterations = 2
     scene = engine.create_scene(scene_cfg)
@@ -591,43 +669,31 @@ def _setup_sapien_scene():
 def _tune_v6_drives(model: HandKinematicModel,
                     kp: float = 400.0, kd: float = 30.0,
                     force_limit: float = 10.0):
-    """Override the PD gains HandKinematicModel set during construction.
-
-    Defaults there are kp=400, kd=10. With self-collision enabled the v6
-    hand gets sharp contact impulses; raising kd damps the resulting PD
-    oscillation. Only used in physics mode (no effect under --kinematic).
-    """
     for j in model.all_joints:
         j.set_drive_property(kp, kd, force_limit=force_limit)
 
 
-# Distinct per-finger colors (RGBA) for visual debugging.
 FINGER_COLORS = {
-    'thumb':  [0.95, 0.30, 0.30, 1.0],   # red
-    'index':  [0.30, 0.55, 0.95, 1.0],   # blue
-    'middle': [0.30, 0.85, 0.40, 1.0],   # green
-    'ring':   [0.95, 0.65, 0.20, 1.0],   # orange
-    'pinky':  [0.75, 0.40, 0.85, 1.0],   # purple
+    'thumb':  [0.95, 0.30, 0.30, 1.0],
+    'index':  [0.30, 0.55, 0.95, 1.0],
+    'middle': [0.30, 0.85, 0.40, 1.0],
+    'ring':   [0.95, 0.65, 0.20, 1.0],
+    'pinky':  [0.75, 0.40, 0.85, 1.0],
 }
 
 
 def _set_link_color(link, rgba):
-    """Recolor all visual shapes of a sapien link. Tries several API variants
-    since sapien 2.x exposes different methods across builds."""
     try:
         bodies = link.get_visual_bodies()
     except AttributeError:
         return
-
     for body in bodies:
-        # Variant 1: per-shape base color via material
         try:
             for shape in body.get_render_shapes():
                 shape.material.set_base_color(rgba)
             continue
         except (AttributeError, TypeError):
             pass
-        # Variant 2: body-level set_color
         try:
             body.set_color(rgba[:3])
         except (AttributeError, TypeError):
@@ -635,7 +701,6 @@ def _set_link_color(link, rgba):
 
 
 def _colorize_v6_fingers(articulation):
-    """Apply FINGER_COLORS to each link whose name starts with a finger prefix."""
     for link in articulation.get_links():
         name = link.get_name()
         for finger, rgba in FINGER_COLORS.items():
@@ -645,21 +710,7 @@ def _colorize_v6_fingers(articulation):
 
 
 class ErgonomicsBarViz:
-    """Open3D dual-row bar chart for debugging the glove → V6 mapping.
-
-    Two rows of 20 bars share the same X ordering (URDF order:
-    thumb→index→middle→ring→pinky × [spread, MCP, PIP, DIP]):
-
-      - Front row (z = -row_z_gap/2): raw Manus ergonomics in degrees.
-        Bar height ∝ value * deg_scale (signed; bars can drop below 0).
-      - Back row (z = +row_z_gap/2): V6 joint angle as fraction of its
-        [lower, upper] range. Bar height ∝ fraction * frac_scale. A red
-        horizontal line marks the fraction = 1.0 (upper limit) level.
-
-    Reading the chart: bars at the same X give "raw sensor → joint range
-    fraction". Saturated bottom bar (touching the red line or sitting at 0)
-    means the joint hit a limit; flat top bar means the sensor isn't moving.
-    """
+    """Open3D dual-row bar chart (front = glove deg, back = joint fraction)."""
 
     FINGERS = ['thumb', 'index', 'middle', 'ring', 'pinky']
     MOTIONS = ['spread', 'mcp', 'pip', 'dip']
@@ -689,7 +740,6 @@ class ErgonomicsBarViz:
         self.boxes_top, self.init_verts_top = [], []
         self.boxes_bot, self.init_verts_bot = [], []
         self.bar_x = np.zeros(20)
-
         z_top = -row_z_gap / 2
         z_bot = +row_z_gap / 2
 
@@ -698,11 +748,9 @@ class ErgonomicsBarViz:
             finger = self.FINGERS[f_idx]
             x = f_idx * finger_spacing + m_idx * motion_spacing
             self.bar_x[i] = x
-
             base = FINGER_COLORS[finger][:3]
             brightness = 1.0 - 0.18 * m_idx
             color = [c * brightness for c in base]
-
             for boxes, init_verts, z_center in (
                 (self.boxes_top, self.init_verts_top, z_top),
                 (self.boxes_bot, self.init_verts_bot, z_bot),
@@ -717,37 +765,26 @@ class ErgonomicsBarViz:
                 init_verts.append(np.asarray(box.vertices).copy())
                 self.vis.add_geometry(box)
 
-        # Reference geometry: world frame + ground lines at y=0 for both rows,
-        # plus a red line at y=frac_scale (= 100% of joint range) for the back row.
         frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
         self.vis.add_geometry(frame)
-
         x_min = -0.5
         x_max = 4 * finger_spacing + 3 * motion_spacing + 0.5
         ref = o3d.geometry.LineSet()
         ref.points = o3d.utility.Vector3dVector([
-            [x_min, 0.0,        z_top],
-            [x_max, 0.0,        z_top],
-            [x_min, 0.0,        z_bot],
-            [x_max, 0.0,        z_bot],
-            [x_min, frac_scale, z_bot],
-            [x_max, frac_scale, z_bot],
+            [x_min, 0.0, z_top], [x_max, 0.0, z_top],
+            [x_min, 0.0, z_bot], [x_max, 0.0, z_bot],
+            [x_min, frac_scale, z_bot], [x_max, frac_scale, z_bot],
         ])
         ref.lines = o3d.utility.Vector2iVector([[0, 1], [2, 3], [4, 5]])
         ref.colors = o3d.utility.Vector3dVector([
-            [0.5, 0.5, 0.5],
-            [0.5, 0.5, 0.5],
-            [0.85, 0.25, 0.25],
+            [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.85, 0.25, 0.25],
         ])
         self.vis.add_geometry(ref)
 
-        # Initial: zero values
         self.update(np.zeros(20), np.zeros(20))
-
         self._first_render = True
 
     def _resize_bar(self, box, init_verts, signed_height):
-        # Avoid degenerate box (causes NaN normals); keep a sliver.
         if abs(signed_height) < 1e-3:
             signed_height = 1e-3 if signed_height >= 0 else -1e-3
         scale = signed_height / self.init_height
@@ -786,28 +823,12 @@ class ErgonomicsBarViz:
         except Exception:
             pass
 
-    @staticmethod
-    def print_legend():
-        print("[ergo viz] Two rows along Z: front = ergonomics (deg, scaled), "
-              "back = joint angle fraction (0..1 of [lower, upper]).")
-        print("[ergo viz] Back-row red line = fraction 1.0 (joint upper limit).")
-        print("[ergo viz] X order: thumb → index → middle → ring → pinky, "
-              "each [spread, MCP, PIP, DIP].")
-        print("[ergo viz] Color: thumb=red, index=blue, middle=green, "
-              "ring=orange, pinky=purple.")
 
-
+# ----------------------------------------------------------------------
+# Tkinter slider window — same scale/offset layout as the sim script, but
+# the bottom row exposes a Modbus broadcast toggle + send-rate spinbox.
+# ----------------------------------------------------------------------
 class TuningSliders:
-    """Tkinter slider window for live editing the Step 2 scales and Step 3
-    offsets used by ManusV6SimNode.transform_glove_to_v6.
-
-    Each slider's `command` callback writes straight into the node's
-    self.scales / self.offsets dicts (atomic dict-item set in CPython, so
-    safe across the ROS callback thread). 5 columns laid out one per finger.
-    Call `poll()` from the main loop to pump tkinter events.
-    """
-
-    # Per-finger groupings: (column title, list of (scale_key, label)).
     _SCALE_LAYOUT = [
         ('Thumb', [
             ('t00_curl',   '00 ← curl'),
@@ -816,24 +837,12 @@ class TuningSliders:
             ('t02',        '02 (MCP)'),
             ('t03',        '03 (IP)'),
         ]),
-        ('Index', [
-            ('i10', '10 (spread)'),
-            ('i11', '11 (MCP)'),
-            ('i12', '12 (PIP)'),
-            ('i13', '13 (DIP)'),
-        ]),
-        ('Middle', [
-            ('m20', '20 (spread)'),
-            ('m21', '21 (MCP)'),
-            ('m22', '22 (PIP)'),
-            ('m23', '23 (DIP)'),
-        ]),
-        ('Ring', [
-            ('r30', '30 (spread)'),
-            ('r31', '31 (MCP)'),
-            ('r32', '32 (PIP)'),
-            ('r33', '33 (DIP)'),
-        ]),
+        ('Index', [('i10', '10 (spread)'), ('i11', '11 (MCP)'),
+                   ('i12', '12 (PIP)'),    ('i13', '13 (DIP)')]),
+        ('Middle', [('m20', '20 (spread)'), ('m21', '21 (MCP)'),
+                    ('m22', '22 (PIP)'),    ('m23', '23 (DIP)')]),
+        ('Ring',  [('r30', '30 (spread)'), ('r31', '31 (MCP)'),
+                   ('r32', '32 (PIP)'),    ('r33', '33 (DIP)')]),
         ('Pinky', [
             ('p40_curl',   '40 ← curl'),
             ('p40_spread', '40 ← spread'),
@@ -842,8 +851,6 @@ class TuningSliders:
             ('p43',        '43 (DIP)'),
         ]),
     ]
-
-    # Per-finger offset keys (URDF order within finger).
     _OFFSET_LAYOUT = [
         ('Thumb',  ['o_t00', 'o_t01', 'o_t02', 'o_t03']),
         ('Index',  ['o_i10', 'o_i11', 'o_i12', 'o_i13']),
@@ -852,22 +859,19 @@ class TuningSliders:
         ('Pinky',  ['o_p40', 'o_p41', 'o_p42', 'o_p43']),
     ]
 
-    # Fonts (bumped up for readability)
     _FONT_HEADER  = ('TkDefaultFont', 13, 'bold')
     _FONT_SECTION = ('TkDefaultFont', 11, 'italic')
     _FONT_LABEL   = ('TkDefaultFont', 11)
     _FONT_SLIDER  = ('TkDefaultFont', 10)
     _FONT_BUTTON  = ('TkDefaultFont', 11, 'bold')
 
-    # Scale-slider keys whose UI direction should be flipped (left/right swap).
-    # The stored value range stays the same; only the slider widget's
-    # `from_` and `to` are exchanged so dragging feels physically inverted.
     _REVERSED_SCALE_KEYS = {'p40_curl'}
 
     def __init__(self, node,
                  scale_magnitude_max=3.5, scale_res=0.1,
                  offset_min=-90.0, offset_max=90.0, offset_res=5.0,
-                 slider_length=200):
+                 slider_length=200,
+                 default_modbus_hz=100):
         try:
             import tkinter as tk
         except ImportError as e:
@@ -884,9 +888,7 @@ class TuningSliders:
         self.slider_length = slider_length
 
         self.root = tk.Tk()
-        self.root.title('V6 Retargeting Tuning')
-
-        # (id(store), key) → tk.DoubleVar  — used by Reset to push values back into sliders
+        self.root.title('V6 Retargeting Tuning (Realtime Modbus)')
         self._slider_vars = {}
 
         outer = tk.Frame(self.root)
@@ -894,26 +896,20 @@ class TuningSliders:
 
         for col_idx, (finger, scale_pairs) in enumerate(self._SCALE_LAYOUT):
             col = tk.LabelFrame(outer, text=finger,
-                                font=self._FONT_HEADER,
-                                padx=6, pady=6)
+                                font=self._FONT_HEADER, padx=6, pady=6)
             col.grid(row=0, column=col_idx, padx=4, sticky='n')
-
-            # --- Step 2 scales for this finger (sign locked to default) ---
             tk.Label(col, text='Step 2 scales  (sign locked)',
                      font=self._FONT_SECTION, fg='#555').pack(anchor='w')
             for key, label in scale_pairs:
                 self._make_scale_slider(col, key, label)
-
             tk.Frame(col, height=2, bg='#bbb').pack(fill='x', pady=6)
-
-            # --- Step 3 offsets for this finger (signed) ---
             tk.Label(col, text='Step 3 offsets (deg, signed)',
                      font=self._FONT_SECTION, fg='#555').pack(anchor='w')
             _, offset_keys = self._OFFSET_LAYOUT[col_idx]
             for okey in offset_keys:
                 self._make_offset_slider(col, okey, okey[2:])
 
-        # Bottom action row 1: Save + Load + Reset
+        # Row 1: Save / Load / Reset
         btn_row = tk.Frame(self.root)
         btn_row.pack(pady=(0, 4))
         tk.Button(btn_row, text='Save', font=self._FONT_BUTTON,
@@ -923,16 +919,34 @@ class TuningSliders:
         tk.Button(btn_row, text='Reset to defaults', font=self._FONT_BUTTON,
                   width=18, command=self._reset_to_defaults).pack(side='left', padx=4)
 
-        # Bottom action row 2: Recording controls
+        # Row 2: Modbus broadcast toggle + Hz
+        bc_row = tk.Frame(self.root)
+        bc_row.pack(pady=(0, 4))
+        self._bc_button = tk.Button(
+            bc_row, text='● Start Broadcast', font=self._FONT_BUTTON,
+            width=20, fg='#a00', command=self._on_broadcast_toggle,
+        )
+        self._bc_button.pack(side='left', padx=4)
+        tk.Label(bc_row, text='Hz:', font=self._FONT_LABEL).pack(side='left', padx=(10, 2))
+        self._bc_hz_var = tk.IntVar(value=int(default_modbus_hz))
+        self._bc_hz_spin = tk.Spinbox(
+            bc_row, from_=1, to=120, increment=1,
+            textvariable=self._bc_hz_var, width=5,
+            font=self._FONT_LABEL,
+        )
+        self._bc_hz_spin.pack(side='left', padx=2)
+        self._bc_status_var = tk.StringVar(value='')
+        tk.Label(bc_row, textvariable=self._bc_status_var,
+                 font=self._FONT_LABEL, fg='#a00').pack(side='left', padx=4)
+
+        # Row 3: Motion recording (txt save) — independent of Modbus
         rec_row = tk.Frame(self.root)
         rec_row.pack(pady=(0, 4))
         self._rec_button = tk.Button(
             rec_row, text='● Start Record', font=self._FONT_BUTTON,
-            width=18, fg='#a00', command=self._on_record_toggle,
+            width=20, fg='#a00', command=self._on_record_toggle,
         )
         self._rec_button.pack(side='left', padx=4)
-
-        # Hz input — glove pubs at 120 Hz max; setting lower decimates.
         tk.Label(rec_row, text='Hz:', font=self._FONT_LABEL).pack(side='left', padx=(10, 2))
         self._rec_hz_var = tk.IntVar(value=50)
         self._rec_hz_spin = tk.Spinbox(
@@ -941,25 +955,20 @@ class TuningSliders:
             font=self._FONT_LABEL,
         )
         self._rec_hz_spin.pack(side='left', padx=2)
-
         self._rec_status_var = tk.StringVar(value='')
         tk.Label(rec_row, textvariable=self._rec_status_var,
                  font=self._FONT_LABEL, fg='#a00').pack(side='left', padx=4)
 
-        # General status (Save / Reset feedback)
+        # General Save/Reset status
         self._status_var = tk.StringVar(value='')
         tk.Label(self.root, textvariable=self._status_var,
                  font=self._FONT_LABEL, fg='#0a0').pack(pady=(0, 4))
 
-        # Start the periodic recording-status updater
+        self._tick_bc_status()
         self._tick_rec_status()
 
+    # ----- slider builders ---------------------------------------------
     def _make_scale_slider(self, parent, key, label):
-        """Step 2 scale slider — sign range determined by the FACTORY default
-        (DEFAULT_SCALES), not the current value. If a previously-saved tuning
-        has the opposite sign for this key (because the factory sign was
-        changed later), its absolute value is taken so the slider can show it
-        in the new range."""
         factory_default = self.node.DEFAULT_SCALES[key]
         current = self.node.scales[key]
         mag = self.scale_magnitude_max
@@ -976,7 +985,6 @@ class TuningSliders:
                           mn, mx, self.scale_res, reverse=reverse)
 
     def _make_offset_slider(self, parent, key, label):
-        """Step 3 offset slider — full bidirectional range."""
         self._make_slider(parent, self.node.offsets, key, label,
                           self.offset_min, self.offset_max, self.offset_res)
 
@@ -986,7 +994,6 @@ class TuningSliders:
         row.pack(fill='x', pady=2)
         tk.Label(row, text=label, width=12, anchor='w',
                  font=self._FONT_LABEL).pack(side='left')
-
         var = tk.DoubleVar(value=store[key])
 
         def on_change(value, k=key, s=store):
@@ -995,8 +1002,6 @@ class TuningSliders:
             except (TypeError, ValueError):
                 pass
 
-        # Reversed slider: passing from_ > to to tk.Scale puts the high end
-        # on the left and the low end on the right — drag direction flips.
         from_, to_ = (mx, mn) if reverse else (mn, mx)
         slider = tk.Scale(row, from_=from_, to=to_, resolution=res,
                           orient='horizontal', variable=var,
@@ -1004,9 +1009,9 @@ class TuningSliders:
                           showvalue=True, command=on_change,
                           font=self._FONT_SLIDER)
         slider.pack(side='left')
-
         self._slider_vars[(id(store), key)] = (var, store)
 
+    # ----- buttons -----------------------------------------------------
     def _reset_to_defaults(self):
         for k, v in self.node.DEFAULT_SCALES.items():
             self.node.scales[k] = v
@@ -1028,12 +1033,46 @@ class TuningSliders:
             self._flash_status('Save failed (see console).')
 
     def _on_load(self):
-        """Re-read the tuning file from disk and push values into the sliders."""
         self.node.reload_tuning()
         for (store_id, key), (var, store) in self._slider_vars.items():
             if key in store:
                 var.set(store[key])
         self._flash_status(f'Loaded ← {self.node.TUNING_FILE.name}')
+
+    def _on_broadcast_toggle(self):
+        mb = self.node.modbus
+        if mb is None:
+            self._flash_status('Modbus not available (see startup logs).')
+            return
+        if mb.broadcasting:
+            stats = mb.stop()
+            self._bc_button.config(text='● Start Broadcast', fg='#a00')
+            err_str = f', {stats["errors"]} err' if stats['errors'] > 0 else ''
+            self._flash_status(
+                f'Stopped — sent {stats["n"]} @ {stats["fps"]:.1f} Hz{err_str}',
+                ms=6000,
+            )
+        else:
+            try:
+                hz = float(self._bc_hz_var.get())
+            except (ValueError, self.tk.TclError):
+                hz = 100.0
+            mb.start(target_hz=hz)
+            self._bc_button.config(text='■ Stop Broadcast', fg='#080')
+
+    def _tick_bc_status(self):
+        mb = self.node.modbus
+        if mb is not None and mb.broadcasting:
+            err_str = f'  ({mb.send_errors} err)' if mb.send_errors > 0 else ''
+            self._bc_status_var.set(
+                f'TX {mb.n_sent} frames  (target {mb._bc_target_hz:.0f} Hz){err_str}'
+            )
+        else:
+            self._bc_status_var.set('')
+        try:
+            self.root.after(200, self._tick_bc_status)
+        except self.tk.TclError:
+            pass
 
     def _on_record_toggle(self):
         if self.node.recording:
@@ -1057,7 +1096,6 @@ class TuningSliders:
             self._rec_button.config(text='■ Stop Record', fg='#080')
 
     def _tick_rec_status(self):
-        """Periodically refresh the recording status label (frame count)."""
         if self.node.recording:
             n = len(self.node.recorded_frames)
             target = getattr(self.node, '_rec_target_hz', 0.0)
@@ -1077,12 +1115,11 @@ class TuningSliders:
             pass
 
     def poll(self):
-        """Pump tkinter events. Call from main loop alongside other viz."""
         try:
             self.root.update_idletasks()
             self.root.update()
         except self.tk.TclError:
-            pass  # window closed
+            pass
 
     def close(self):
         try:
@@ -1091,8 +1128,10 @@ class TuningSliders:
             pass
 
 
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
 def _apply_qpos(model: HandKinematicModel, qpos_user, kinematic: bool):
-    """Apply a user-order qpos to the sim model (kinematic snap or PD target)."""
     if kinematic:
         clipped = np.clip(qpos_user,
                           model.joint_lower_limit + 1e-3,
@@ -1106,115 +1145,157 @@ def _apply_qpos(model: HandKinematicModel, qpos_user, kinematic: bool):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='V6 hand rule-based retargeting (simulator verification).',
+        description='V6 hand rule-based retargeting with real-time Modbus output.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Default: kinematic snap + live tuning sliders, /manus_glove_right
-  python v6_rule_based_retargeting.py
+  # Default: sim + tuner + RTU Modbus on /dev/ttyUSB0 @ 115200, slave 1
+  python v6_rule_based_retargeting_realtime.py
 
-  # Physics-mode PD drive instead of kinematic snap
-  python v6_rule_based_retargeting.py --no-kinematic
+  # TCP Modbus
+  python v6_rule_based_retargeting_realtime.py --modbus-method tcp \\
+      --modbus-host 192.168.1.10 --modbus-tcp-port 502
 
-  # Skip the slider window
-  python v6_rule_based_retargeting.py --no-tune
+  # Different serial port and 50 Hz default send rate
+  python v6_rule_based_retargeting_realtime.py --modbus-port /dev/ttyACM0 \\
+      --modbus-hz 50
 
-  # Left glove instead (requires a v6_left config to exist)
-  python v6_rule_based_retargeting.py --hand v6_left --side left
+  # Sim/tune only, no Modbus
+  python v6_rule_based_retargeting_realtime.py --no-modbus
         """
     )
-    parser.add_argument('--hand', type=str, default='v6_right',
-                        help='Config name to load (default: v6_right)')
-    parser.add_argument('--side', type=str, choices=['left', 'right'], default='right',
-                        help='Glove side to subscribe to (default: right)')
+    parser.add_argument('--hand', type=str, default='v6_right')
+    parser.add_argument('--side', type=str, choices=['left', 'right'], default='right')
     parser.add_argument('--no-kinematic', action='store_false', dest='kinematic',
-                        help='Run physics-mode PD drive with self-collision response '
-                             '(gains pre-tuned in _tune_v6_drives) instead of the '
-                             'default kinematic snap. Physics mode may wobble on v6.')
+                        help='Physics-mode PD drive instead of kinematic snap.')
     parser.add_argument('--no-ergo-viz', action='store_true',
-                        help='Disable the Open3D ergonomics / joint-fraction debug window.')
+                        help='Disable the ergo / joint-fraction Open3D window.')
     parser.add_argument('--no-tune', action='store_false', dest='tune',
-                        help='Disable the tkinter live tuning slider window '
-                             '(it is open by default).')
+                        help='Disable the tkinter slider window.')
+    parser.add_argument('--no-sim', action='store_false', dest='sim',
+                        help='Skip Sapien viewer (Modbus + tuner only).')
+
+    # Modbus options
+    parser.add_argument('--no-modbus', action='store_false', dest='modbus_enabled',
+                        help='Disable Modbus output entirely.')
+    parser.add_argument('--modbus-method', choices=['rtu', 'tcp'], default='rtu')
+    parser.add_argument('--modbus-port', type=str, default='/dev/ttyUSB0')
+    parser.add_argument('--modbus-baud', type=int, default=2_000_000,
+                        help='RTU baud rate (default 2 Mbaud, matches v6_modbus_rtu_demo.py).')
+    parser.add_argument('--modbus-host', type=str, default='localhost')
+    parser.add_argument('--modbus-tcp-port', type=int, default=502)
+    parser.add_argument('--modbus-slave-id', type=int, default=1)
+    parser.add_argument('--modbus-start-reg', type=int,
+                        default=ModbusBroadcaster.ADDRESS_CMD_POSITION,
+                        help='Position command holding-register address '
+                             '(default 0x10 = address_cmd_position).')
+    parser.add_argument('--modbus-hz', type=float, default=100.0,
+                        help='Default send rate (Hz). Adjustable from the slider window.')
+
     args = parser.parse_args()
 
     # --------------------------------------------------------------------
-    # Sapien scene + hand model + viewer
+    # Modbus init (soft-fail: keeps running without it)
     # --------------------------------------------------------------------
-    engine, renderer, scene = _setup_sapien_scene()
-
-    config = get_config(args.hand)
-    print(f"[v6_rule_based_retargeting] loading config: {config['name']}")
-
-    model = HandKinematicModel.build_from_config(config, scene=scene, render=False)
-    # Pose the hand so it's visible & oriented like in hand_debug.py
-    model.hand.set_root_pose(sapien.Pose([0.0, 0.0, 0.35], [0.695, 0.0, -0.718, 0.0]))
-
-    # Per-finger colors for visual clarity (URDF is uniform gray otherwise)
-    _colorize_v6_fingers(model.hand)
-
-    # Retune PD gains for v6 self-collision stability (only matters in physics mode)
-    if not args.kinematic:
-        _tune_v6_drives(model)
-
-    # Fingertip markers (for visual sanity check)
-    links = [info['link'] for info in config['fingertip_link']]
-    offsets = [info['center_offset'] for info in config['fingertip_link']]
-    model.initialize_keypoint(links, offsets)
-
-    viewer_env = HandViewerEnv([model], scene=scene, renderer=renderer)
+    modbus = None
+    if args.modbus_enabled:
+        if not _PYMODBUS_AVAILABLE:
+            print('[main] pymodbus not installed — Modbus output disabled. '
+                  '(pip install pymodbus)')
+        else:
+            try:
+                modbus = ModbusBroadcaster(
+                    method=args.modbus_method,
+                    port=args.modbus_port,
+                    baudrate=args.modbus_baud,
+                    host=args.modbus_host,
+                    tcp_port=args.modbus_tcp_port,
+                    slave_id=args.modbus_slave_id,
+                    start_register=args.modbus_start_reg,
+                    default_hz=args.modbus_hz,
+                )
+                if modbus.connect():
+                    print(f'[main] Modbus connected '
+                          f'({args.modbus_method}, slave {args.modbus_slave_id}, '
+                          f'start reg {args.modbus_start_reg}).')
+                else:
+                    print('[main] Modbus connect failed — broadcast disabled. '
+                          'Sliders will still run; check wiring and re-Start.')
+            except Exception as e:
+                print(f'[main] Modbus init error: {e} — broadcast disabled.')
+                modbus = None
 
     # --------------------------------------------------------------------
-    # Optional Open3D dual-row debug window
-    #   front row: ergonomics (deg)
-    #   back row : V6 joint angle as fraction of [lower, upper]
+    # Sapien (optional)
+    # --------------------------------------------------------------------
+    model = None
+    viewer_env = None
+    if args.sim:
+        engine, renderer, scene = _setup_sapien_scene()
+        config = get_config(args.hand)
+        print(f"[main] loading sim config: {config['name']}")
+        model = HandKinematicModel.build_from_config(config, scene=scene, render=False)
+        model.hand.set_root_pose(sapien.Pose([0.0, 0.0, 0.35], [0.695, 0.0, -0.718, 0.0]))
+        _colorize_v6_fingers(model.hand)
+        if not args.kinematic:
+            _tune_v6_drives(model)
+        links = [info['link'] for info in config['fingertip_link']]
+        offsets = [info['center_offset'] for info in config['fingertip_link']]
+        model.initialize_keypoint(links, offsets)
+        viewer_env = HandViewerEnv([model], scene=scene, renderer=renderer)
+
+    # --------------------------------------------------------------------
+    # Optional ergo viz
     # --------------------------------------------------------------------
     ergo_viz = None
     if not args.no_ergo_viz:
         ergo_viz = ErgonomicsBarViz(V6_LOWER_LIMITS, V6_UPPER_LIMITS)
-        ErgonomicsBarViz.print_legend()
 
     # --------------------------------------------------------------------
-    # ROS2 init + background spin
+    # ROS node + background spin
     # --------------------------------------------------------------------
     rclpy.init()
-    node = ManusV6SimNode(side=args.side)
+    node = ManusV6RealtimeNode(side=args.side, modbus=modbus)
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 
     # --------------------------------------------------------------------
-    # Optional tkinter slider window for live tuning
+    # Optional tuner window
     # --------------------------------------------------------------------
     tuner = None
     if args.tune:
         try:
-            tuner = TuningSliders(node)
-            print("[v6_rule_based_retargeting] tuning slider window open.")
+            tuner = TuningSliders(node, default_modbus_hz=args.modbus_hz)
+            print('[main] tuning slider window open.')
         except RuntimeError as e:
-            print(f"[v6_rule_based_retargeting] failed to open tuner: {e}")
+            print(f'[main] failed to open tuner: {e}')
 
     mode_str = 'kinematic snap' if args.kinematic else 'physics / PD'
-    print(f"[v6_rule_based_retargeting] running in {mode_str} mode. "
+    mb_str = 'modbus ENABLED' if modbus is not None and modbus.connected else 'modbus OFF'
+    sim_str = 'sim ON' if model is not None else 'sim OFF'
+    print(f"[main] running ({sim_str}, {mode_str}, {mb_str}). "
           f"Waiting for /manus_glove_{args.side} ...")
 
     # --------------------------------------------------------------------
-    # Main viewer loop: read latest qpos and apply, then render one frame
+    # Main loop
     # --------------------------------------------------------------------
     try:
         while True:
             qpos = node.latest_qpos
-            if qpos is not None:
+            if qpos is not None and model is not None:
                 _apply_qpos(model, qpos, args.kinematic)
 
-            if args.kinematic:
-                # Skip physics: just update markers + render. Matches the
-                # --kinematic branch in hand_debug.py.
-                viewer_env._update_tip_positions()
-                viewer_env._update_axis_markers()
-                viewer_env.scene.update_render()
-                viewer_env.viewer.render()
+            if viewer_env is not None:
+                if args.kinematic:
+                    viewer_env._update_tip_positions()
+                    viewer_env._update_axis_markers()
+                    viewer_env.scene.update_render()
+                    viewer_env.viewer.render()
+                else:
+                    viewer_env.update()
             else:
-                viewer_env.update()
+                # No sim window — sleep a bit so we don't busy-loop.
+                time.sleep(0.005)
 
             if ergo_viz is not None:
                 ergo_viz.update(node.latest_glove20, node.latest_qpos)
@@ -1225,6 +1306,10 @@ Examples:
     except KeyboardInterrupt:
         pass
     finally:
+        if modbus is not None:
+            if modbus.broadcasting:
+                modbus.stop()
+            modbus.disconnect()
         if tuner is not None:
             tuner.close()
         if ergo_viz is not None:
@@ -1233,5 +1318,5 @@ Examples:
         rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

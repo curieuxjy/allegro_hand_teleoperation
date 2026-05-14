@@ -374,7 +374,16 @@ class GeoRTTrainer:
             criterion_col = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             col_optim = optim.Adam(model.parameters(), lr=1e-3)
 
+            # ReduceLROnPlateau halves the LR when val_loss stalls for
+            # `scheduler_patience` epochs — softer first-response before we
+            # outright stop training.
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                col_optim, mode='min', factor=0.5,
+                patience=COL_LR_PATIENCE, min_lr=1e-6,
+            )
+
             best_val_loss = float("inf")
+            patience_counter = 0   # consecutive epochs without val improvement
             for epoch in range(COL_ITER):
                 # ----- train -----
                 model.train()
@@ -401,22 +410,49 @@ class GeoRTTrainer:
 
                 tr_loss = float(np.mean(tr_losses))
                 va_loss = float(np.mean(va_losses))
+                current_lr = col_optim.param_groups[0]['lr']
                 print(f"Collision Classifier Epoch: {epoch}; "
-                      f"Train: {tr_loss:.4f}  Val: {va_loss:.4f}")
+                      f"Train: {tr_loss:.4f}  Val: {va_loss:.4f}  "
+                      f"LR: {current_lr:.2e}")
 
                 if self.logger:
                     self.logger.log({
                         "Collision/TrainLoss": tr_loss,
                         "Collision/ValLoss": va_loss,
+                        "Collision/LR": current_lr,
                     })
 
-                # Best-by-val-loss checkpoint (matches collision_classifier.py)
+                # Best-by-val-loss checkpoint; reset patience when we improve,
+                # otherwise increment toward early-stop.
                 if va_loss < best_val_loss:
                     best_val_loss = va_loss
+                    patience_counter = 0
                     torch.save({
                         "state_dict": model.state_dict(),
                         "config": {"dof": dof, "hidden": hidden, "hand": hand_name},
                     }, ckpt_path)
+                else:
+                    patience_counter += 1
+
+                # Step LR scheduler AFTER the best-checkpoint check so that
+                # the LR drop reflects what we just observed for this epoch.
+                scheduler.step(va_loss)
+
+                # Early stop: val hasn't improved for COL_EARLY_STOP_PATIENCE
+                # consecutive epochs — further training is just overfitting.
+                if patience_counter >= COL_EARLY_STOP_PATIENCE:
+                    print(f"[Collision] Early stopping at epoch {epoch} "
+                          f"(no val improvement for {COL_EARLY_STOP_PATIENCE} epochs; "
+                          f"best val_loss={best_val_loss:.4f}).")
+                    break
+
+            # Always restore best-val checkpoint before freezing — the model
+            # at the end of the loop (early-stop or full COL_ITER) may be
+            # overfit relative to the best one we saved.
+            if ckpt_path.exists():
+                best_ckpt = torch.load(ckpt_path, map_location="cuda")
+                model.load_state_dict(best_ckpt["state_dict"])
+                print(f"[Collision] Restored best classifier (val_loss={best_val_loss:.4f}).")
 
         model.eval()
         for p in model.parameters():
@@ -1010,9 +1046,16 @@ if __name__ == '__main__':
     DRAW_CHAMFER = True
     WANDB = not args.no_wandb
     FK_ITER = 250
-    COL_ITER = 150   # Collision classifier epochs (Criterion V) — only used when
-                    #   --w_collision > 0 AND no classifier checkpoint exists.
-                    #   Mirrors collision_classifier.py's --epochs default.
+    COL_ITER = 150   # Collision classifier MAX epochs (Criterion V) — only used
+                    #   when --w_collision > 0 AND no classifier checkpoint exists.
+                    #   Training may stop earlier via the patience knobs below.
+    COL_LR_PATIENCE = 3          # ReduceLROnPlateau patience for COL: halve LR
+                                 #   after this many epochs without val_loss
+                                 #   improvement (soft response before stopping).
+    COL_EARLY_STOP_PATIENCE = 7  # Stop COL training after this many CONSECUTIVE
+                                 #   epochs without val_loss improvement
+                                 #   (overfit guard). Must be > COL_LR_PATIENCE so
+                                 #   the LR drop has a chance to help first.
     IK_ITER = 1500 # 2500
     HUMAN_POINT_DATASET_N = 20000
     POINT_BATCH_SIZE = 4096

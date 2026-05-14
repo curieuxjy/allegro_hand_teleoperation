@@ -115,12 +115,21 @@ def main():
     parser = argparse.ArgumentParser(description="Train the collision classifier.")
     parser.add_argument("--hand", type=str, required=True,
                         help="Hand config name (e.g., v6_right.json)")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=50,
+                        help="Maximum epochs. Training may stop earlier via "
+                             "early stopping (see --early_stop_patience).")
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--val_frac", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lr_patience", type=int, default=3,
+                        help="ReduceLROnPlateau patience: halve LR after this many "
+                             "epochs without val_loss improvement (default 3).")
+    parser.add_argument("--early_stop_patience", type=int, default=7,
+                        help="Stop training after this many consecutive epochs "
+                             "without val_loss improvement (default 7). Must be > "
+                             "--lr_patience so the LR drop has a chance to help first.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -177,11 +186,17 @@ def main():
     model = CollisionClassifier(dof=dof, hidden=args.hidden).cuda()
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # Halve LR when val_loss stalls — softer first response before we stop.
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5,
+        patience=args.lr_patience, min_lr=1e-6,
+    )
 
     ckpt_path = classifier_ckpt_path(hand_name)
     os.makedirs(get_checkpoint_root(), exist_ok=True)
 
     best_val_loss = float("inf")
+    patience_counter = 0  # consecutive epochs without val improvement
 
     for epoch in range(1, args.epochs + 1):
         # ------- train pass -------
@@ -224,14 +239,17 @@ def main():
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-7)
+        current_lr = optimizer.param_groups[0]['lr']
         print(
             f"Epoch {epoch:3d}: train_loss={tr_loss:.4f} val_loss={va_loss:.4f}  "
             f"train_acc={tr_correct / tr_total:.4f} val_acc={va_correct / va_total:.4f}  "
-            f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}"
+            f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  LR={current_lr:.2e}"
         )
 
+        # Best-by-val-loss checkpoint + patience tracking.
         if va_loss < best_val_loss:
             best_val_loss = va_loss
+            patience_counter = 0
             torch.save({
                 "state_dict": model.state_dict(),
                 "config": {"dof": dof, "hidden": args.hidden, "hand": hand_name},
@@ -243,6 +261,18 @@ def main():
                     "f1": f1,
                 },
             }, ckpt_path)
+        else:
+            patience_counter += 1
+
+        # Drop LR on plateau (after best-ckpt check so the LR change reflects
+        # what we just observed for this epoch).
+        scheduler.step(va_loss)
+
+        # Hard stop once val has stopped improving for early_stop_patience epochs.
+        if patience_counter >= args.early_stop_patience:
+            print(f"\nEarly stopping at epoch {epoch} "
+                  f"(no val improvement for {args.early_stop_patience} epochs).")
+            break
 
     print(f"\nBest classifier saved to: {ckpt_path}")
     print(f"  best val_loss: {best_val_loss:.4f}")

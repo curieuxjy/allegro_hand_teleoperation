@@ -4,6 +4,26 @@
      For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
 <robot
   name="aph_right">
+  <!-- virtual_base: aligns aph's wrist-mounted base_link to the GeoRT
+       template convention (X = palm normal, Y = palm to thumb, Z = palm to
+       middle finger), AND moves the origin to the middle-finger MCP — the
+       same reference frame allegro_right uses, which is required for
+       chamfer-loss matching against the human mocap data.
+
+       Translation: virtual_base sits at aph's middle-finger MCP, at
+         (0, -0.00125, 0.0905) in the original base_link frame.
+       Rotation: +90 deg around Z so aph +X (thumb side) → +Y (template),
+         and aph -Y (palm normal) → +X (template).
+       After expressing the original base_link pose in virtual_base coords:
+         xyz = R_z(+pi/2) * (0, +0.00125, -0.0905) = (-0.00125, 0, -0.0905)
+         rpy = (0, 0, +pi/2) -->
+  <link name="virtual_base"/>
+  <joint name="virtual_base_to_base_link" type="fixed">
+    <parent link="virtual_base"/>
+    <child link="base_link"/>
+    <origin xyz="-0.00125 0 -0.0905" rpy="0 0 1.5708"/>
+  </joint>
+
   <link
     name="base_link">
     <inertial>

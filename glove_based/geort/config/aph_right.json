@@ -1,0 +1,53 @@
+{
+    "README!!": "aph_right hand (16 DOF, 4 fingers — Thumb, Index, Middle, Ring; no pinky). fingertip link is the distal phalanx (_3 link); center_offset pushes the keypoint past the link origin to the actual fingertip pad along the link's principal axis. The _tip links in the URDF are fixed-joint visual stubs (parent joint origin from _3 plus tip-mesh half-length ~0.024 ≈ fingertip pad world position). The URDF was retrofitted with a `virtual_base` fixed-joint parent (same pattern as v6_right) so the base frame matches the GeoRT/allegro_right convention (X=palm normal, Y=palm-to-thumb, Z=palm-to-middle, origin at middle-finger MCP). Verify with `python glove_based/geort/env/hand_debug.py --hand aph_right`.",
+
+    "name": "aph_right",
+    "urdf_path": "./assets/aph_right/aph_right.urdf",
+
+    "base_link": "virtual_base",
+
+    "joint_order": [
+        "joint_00", "joint_01", "joint_02", "joint_03",
+        "joint_10", "joint_11", "joint_12", "joint_13",
+        "joint_20", "joint_21", "joint_22", "joint_23",
+        "joint_30", "joint_31", "joint_32", "joint_33"
+    ],
+
+    "fingertip_link": [
+        {
+            "name": "index",
+            "link": "index_3",
+            "joint": ["joint_10", "joint_11", "joint_12", "joint_13"],
+            "_offset_note": "index_3 origin → fingertip pad: index_tip_mount xyz=(0.0016, -0.0005, 0.0178) plus tip mesh half-length ~0.024 along its local +Z. Result: small radial tilt (+0.0036 X) and ~0.042 Z.",
+            "center_offset": [0.0036, 0.0, 0.042],
+            "human_hand_id": 8
+        },
+
+        {
+            "name": "middle",
+            "link": "middle_3",
+            "joint": ["joint_20", "joint_21", "joint_22", "joint_23"],
+            "_offset_note": "Pure +Z along the link's principal axis (middle is the centerline finger; no radial tilt).",
+            "center_offset": [0.0, 0.0, 0.042],
+            "human_hand_id": 12
+        },
+
+        {
+            "name": "ring",
+            "link": "ring_3",
+            "joint": ["joint_30", "joint_31", "joint_32", "joint_33"],
+            "_offset_note": "Mirror of index: ring_tip_mount xyz=(-0.0016, -0.0005, 0.0178) plus tip extension ~0.024 → slight ulnar tilt (-0.0036 X) and ~0.042 Z.",
+            "center_offset": [-0.0036, 0.0, 0.042],
+            "human_hand_id": 16
+        },
+
+        {
+            "name": "thumb",
+            "link": "thumb_3",
+            "joint": ["joint_00", "joint_01", "joint_02", "joint_03"],
+            "_offset_note": "Thumb tip extends along +X: thumb_tip_mount xyz=(0.029, 0, 0) plus tip mesh half-length ~0.024 ≈ 0.053 along local +X.",
+            "center_offset": [0.053, 0.0, 0.0],
+            "human_hand_id": 4
+        }
+    ]
+}

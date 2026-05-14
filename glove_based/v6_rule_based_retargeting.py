@@ -98,8 +98,13 @@ V6_SCALE_LAYOUT = [
         ('t03',        '03 (IP)'),
     ]),
     ('Index', [
-        ('i10', '10 (spread)'), ('i11', '11 (MCP)'),
-        ('i12', '12 (PIP)'),    ('i13', '13 (DIP)'),
+        # i10 (IndexMCPSpread) is dropped by the Manus publisher;
+        # j10 is synthesized at Step 2 from middle + ring spread.
+        ('i_from_m', '10 ← middle'),
+        ('i_from_r', '10 ← ring'),
+        ('i11', '11 (MCP)'),
+        ('i12', '12 (PIP)'),
+        ('i13', '13 (DIP)'),
     ]),
     ('Middle', [
         ('m20', '20 (spread)'), ('m21', '21 (MCP)'),
@@ -146,8 +151,10 @@ class ManusV6SimNode(Node):
         # Thumb
         't00_curl': 1.0, 't00_spread': 1.0,
         't01': 1.0, 't02': 1.0, 't03': 1.0,
-        # Index
-        'i10': 1.0, 'i11': 1.0, 'i12': 1.0, 'i13': 1.0,
+        # Index (i10 is omitted — IndexMCPSpread is dropped by the
+        # Manus publisher and j10 is synthesized in Step 2 from
+        # middle + ring spread terms; see i_from_m / i_from_r below.)
+        'i11': 1.0, 'i12': 1.0, 'i13': 1.0,
         # Middle
         'm20': 1.0, 'm21': 1.0, 'm22': 1.0, 'm23': 1.0,
         # Ring
@@ -155,6 +162,10 @@ class ManusV6SimNode(Node):
         # Pinky
         'p40_curl': 1.0, 'p40_spread': 1.0,
         'p41': 1.0, 'p42': 1.0, 'p43': 1.0,
+        # IndexMCPSpread synthesis weights — j10 is mixed from middle
+        # (m20 term) and ring (r30 term) in Step 2. Default 0.5/0.5 →
+        # index sits halfway between middle and ring during splay.
+        'i_from_m': 0.5, 'i_from_r': 0.5,
     }
 
     DEFAULT_OFFSETS = {
@@ -184,7 +195,6 @@ class ManusV6SimNode(Node):
         't01':        (160.0, 'stretch'),
         't02':        (90.0,  'stretch'),
         't03':        (90.0,  'stretch'),
-        'i10':        (90.0,  'spread'),
         'i11':        (100.0, 'stretch'),
         'i12':        (90.0,  'stretch'),
         'i13':        (90.0,  'stretch'),
@@ -335,12 +345,13 @@ class ManusV6SimNode(Node):
 
         Pipeline:
           1. slice per-finger glove values
-          2. normalized scale: term_deg = scale × (ergo/ERGO_MAX) × amp
+          2. normalized scale (j10 index spread synthesized inline here
+             from middle + ring terms via `i_from_m` / `i_from_r`)
           3. additive per-joint offset (deg)
           4. deg → rad
           5. clip to V6_LOWER/UPPER_LIMITS (also discards hyperextension)
           6. EMA smoothing (prev_arr is stored constraint-compliant)
-          7. anti-collision clamp + IndexMCPSpread synthesis
+          7. anti-collision clamp (pinky j41 ≤ ring j30)
         """
         # Step 1 — per-finger 4-vectors in [spread, MCP, PIP, DIP] order.
         # index_vals[0] is always 0 because the Manus publisher drops
@@ -355,6 +366,7 @@ class ManusV6SimNode(Node):
         # Joint range annotations below are deg from V6_LOWER/UPPER_LIMITS
         # and explain WHY each per-joint sign was chosen.
         n = self._norm
+        s = self.scales
         angle_deg = np.array([
             # ── Thumb ────────────────────────────────────────────────
             # j00 [±80°]: V6 puts CMC flexion AND CMC abduction on the
@@ -369,9 +381,13 @@ class ManusV6SimNode(Node):
             n('t03', thumb_vals[3]),  # j03 [-5..90°]: IP  flex (ThumbDIPStretch)
             # ── Index ────────────────────────────────────────────────
             # j10 [-10..90°]: MCP spread. IndexMCPSpread is dropped by
-            # the Manus publisher so val[0] is always 0 → this line
-            # evaluates to 0 and is overwritten by Step 7b below.
-            n('i10', index_vals[0]),
+            # the Manus publisher (val[0] always 0), so j10 is
+            # synthesized here from the SAME middle (m20) and ring (r30)
+            # normalized terms used below, mixed via tunable weights
+            # `i_from_m` / `i_from_r` (default 0.5 / 0.5 — index sits
+            # halfway between middle and ring during splay).
+            (s['i_from_m'] * n('m20', middle_vals[0])
+             + s['i_from_r'] * n('r30', ring_vals[0])),
             n('i11', index_vals[1]),  # j11 [0..100°]: MCP flex
             n('i12', index_vals[2]),  # j12 [-5..90°]: PIP flex
             n('i13', index_vals[3]),  # j13 [-5..90°]: DIP flex
@@ -429,7 +445,7 @@ class ManusV6SimNode(Node):
         else:
             smoothed = self.alpha * arr + (1.0 - self.alpha) * self.prev_arr
 
-        # Step 7a — V6 geometry anti-collision: pinky j41 (idx 17,
+        # Step 7 — V6 geometry anti-collision: pinky j41 (idx 17,
         # MCP-like flex) must stay ≤ ring j30 (idx 12, spread). The two
         # are different axis types; this is an empirical clamp on V6
         # link geometry, not a physiological constraint. When ring
@@ -437,14 +453,6 @@ class ManusV6SimNode(Node):
         # least as negative or the links overlap.
         if smoothed[17] > smoothed[12]:
             smoothed[17] = smoothed[12]
-
-        # Step 7b — synthesize IndexMCPSpread. The Manus publisher drops
-        # the index spread channel, so smoothed[4] is 0 from Step 2. We
-        # approximate index spread as 1.2 × middle spread (smoothed[8])
-        # on the assumption that during a hand-splay gesture, index
-        # tracks middle in the same direction with slightly larger
-        # amplitude. Empirical multiplier — re-tune if needed.
-        smoothed[4] = smoothed[8] * 1.2
 
         self.prev_arr = smoothed
         return smoothed

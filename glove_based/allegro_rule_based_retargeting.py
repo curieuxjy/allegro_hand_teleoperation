@@ -93,8 +93,13 @@ def _allegro_link_classifier(link_name: str):
 # ----------------------------------------------------------------------
 ALLEGRO_SCALE_LAYOUT = [
     ('Index', [
-        ('i10', '10 (spread)'), ('i11', '11 (MCP)'),
-        ('i12', '12 (PIP)'),    ('i13', '13 (DIP)'),
+        # i10 (IndexMCPSpread) is dropped by the Manus publisher;
+        # joint_0 is synthesized at Step 2 from middle + ring spread.
+        ('i_from_m', '0 ← middle'),
+        ('i_from_r', '0 ← ring'),
+        ('i11', '11 (MCP)'),
+        ('i12', '12 (PIP)'),
+        ('i13', '13 (DIP)'),
     ]),
     ('Middle', [
         ('m20', '20 (spread)'), ('m21', '21 (MCP)'),
@@ -135,12 +140,13 @@ class ManusAllegroSimNode(Node):
     # multipliers (`*2.5`, `*2`) into a single pre-deg2rad scale.
     DEFAULT_SCALES = {
         # Thumb
-        't00': -4.375,   # arr[0] (CMC, joint_12)  ← (-1.75 * v[1]) * 2.5
-        't01':  6.0,     # arr[1] (base, joint_13) ← (3.0 * v[0]) * 2
-        't02':  3.0,     # arr[2] (mid,  joint_14) ← 3.0 * v[2]
-        't03':  2.0,     # arr[3] (tip,  joint_15) ← v[3] * 2
-        # Index
-        'i10': -0.5,
+        't00': -4.375,   # arr[12] (CMC, joint_12)  ← (-1.75 * v[1]) * 2.5
+        't01':  6.0,     # arr[13] (base, joint_13) ← (3.0 * v[0]) * 2
+        't02':  3.0,     # arr[14] (mid,  joint_14) ← 3.0 * v[2]
+        't03':  2.0,     # arr[15] (tip,  joint_15) ← v[3] * 2
+        # Index (i10 is omitted — IndexMCPSpread is dropped by the
+        # Manus publisher and joint_0 is synthesized in Step 2 from
+        # middle + ring spread terms; see i_from_m / i_from_r below.)
         'i11':  1.5, 'i12': 1.0, 'i13': 2.0,
         # Middle
         'm20': -0.2,
@@ -148,6 +154,10 @@ class ManusAllegroSimNode(Node):
         # Ring
         'r30':  0.1,
         'r31':  1.5, 'r32': 1.0, 'r33': 2.0,
+        # IndexMCPSpread synthesis weights — joint_0 is mixed from
+        # middle (m20 term) and ring (r30 term) in Step 2. Default
+        # 0.5/0.5 → index sits halfway between middle and ring on splay.
+        'i_from_m': 0.5, 'i_from_r': 0.5,
     }
 
     DEFAULT_OFFSETS = {
@@ -260,38 +270,101 @@ class ManusAllegroSimNode(Node):
     # ----- Glove → Allegro mapping ------------------------------------
     def transform_glove_to_allegro(self, glove16):
         """
-        16-D glove ergonomics → 16-D Allegro joint angles (sim joint order:
-        Index → Middle → Ring → Thumb).
+        16-D Manus glove ergonomics → 16-D Allegro joint angles
+        (sim joint order: Index → Middle → Ring → Thumb).
+
+        Glove channel layout per finger (`val[k]` below), per ERGONOMICS.md §2
+        and `_ergonomics_to_array`:
+            val[0] = {Finger}Spread / ThumbMCPSpread     — abduction (deg)
+            val[1] = {Finger}MCPStretch / ThumbMCPStretch — MCP / CMC flex
+            val[2] = {Finger}PIPStretch / ThumbPIPStretch — PIP / MCP flex
+            val[3] = {Finger}DIPStretch / ThumbDIPStretch — DIP / IP  flex
+        Per ERGONOMICS.md §3, "*Stretch" is flexion and + = curl into palm.
+
+        RIGHT-HAND ONLY for spread signs (per ERGONOMICS.md §3 the non-thumb
+        Spread channels mirror between left and right; `--side=left` would
+        require re-tuning every spread scale below).
+
+        THUMB CROSS-CHANNEL SWAP (intentional, inherited from the legacy
+        hardware-publishing rule_based_retargeting.py):
+          joint_12 (CMC-like)  ← val[1]   (NOT val[0])
+          joint_13 (base swing) ← val[0]  (NOT val[1])
+        This deviates from the natural Spread→abduction / Stretch→flex
+        mapping because Allegro's thumb joint axis convention is rotated
+        relative to the Manus sensor frame on this finger.
+
+        Other notes vs V6:
+          * Pinky glove data is silently ignored (Allegro has no pinky).
+          * Index spread is dropped by the Manus publisher → val[0] always 0;
+            synthesized inline in Step 2 from middle (m20) + ring (r30)
+            spread terms via tunable weights `i_from_m` / `i_from_r`
+            (default 0.5 / 0.5).
+          * No `_norm`/SCALE_NORM_INFO normalization — raw `scale × ergo_deg`.
+
+        Pipeline: extract → scale (deg, with index j0 synthesized inline) →
+                  offset (deg) → deg→rad → clip → EMA.
         """
+        # Step 1 — per-finger 4-vectors in [Spread, MCP, PIP, DIP] order (deg).
+        # index_vals[0] is always 0 because the Manus publisher drops
+        # IndexMCPSpread (ErgonomicsDataTypeToSide bug).
         index_vals  = np.array(glove16[0:4],   dtype=float)
         middle_vals = np.array(glove16[4:8],   dtype=float)
         ring_vals   = np.array(glove16[8:12],  dtype=float)
         thumb_vals  = np.array(glove16[12:16], dtype=float)
 
+        # Step 2 — raw `scale × ergo_deg`. Joint range annotations below are
+        # from ALLEGRO_LOWER/UPPER_LIMITS (converted to deg for readability)
+        # and explain WHY each scale sign was chosen.
         s = self.scales
         angle_deg = np.array([
-            # Index (joint_0..3)
-            s['i10'] * index_vals[0],
-            s['i11'] * index_vals[1],
-            s['i12'] * index_vals[2],
-            s['i13'] * index_vals[3],
-            # Middle (joint_4..7)
+            # ── Index (joint_0..3) ────────────────────────────────────
+            # j0 [±27°]: spread. IndexMCPSpread is dropped by the
+            # publisher (val[0] always 0), so joint_0 is synthesized
+            # here from the SAME middle (m20) and ring (r30) raw scale
+            # terms used below, mixed via tunable weights
+            # `i_from_m` / `i_from_r` (default 0.5 / 0.5).
+            (s['i_from_m'] * s['m20'] * middle_vals[0]
+             + s['i_from_r'] * s['r30'] * ring_vals[0]),
+            s['i11'] * index_vals[1],   # j1 [-11..+92°]: MCP flex (+ → +)
+            s['i12'] * index_vals[2],   # j2 [-10..+98°]: PIP flex (+ → +)
+            s['i13'] * index_vals[3],   # j3 [-13..+93°]: DIP flex (+ → +)
+            # ── Middle (joint_4..7) ───────────────────────────────────
+            # j4 [±27°]: spread. m20 < 0 (empirical sign chosen so the
+            # right-hand glove's middle-spread polarity aligns with
+            # Allegro's joint-4 axis convention).
             s['m20'] * middle_vals[0],
-            s['m21'] * middle_vals[1],
-            s['m22'] * middle_vals[2],
-            s['m23'] * middle_vals[3],
-            # Ring (joint_8..11)
+            s['m21'] * middle_vals[1],  # j5 [-11..+92°]: MCP flex
+            s['m22'] * middle_vals[2],  # j6 [-10..+98°]: PIP flex
+            s['m23'] * middle_vals[3],  # j7 [-13..+93°]: DIP flex
+            # ── Ring (joint_8..11) ────────────────────────────────────
+            # j8 [±27°]: spread. r30 > 0: direct mapping consistent with
+            # the right-hand convention that ring splay (ulnar) shows
+            # up as negative Manus Spread → negative Allegro joint.
             s['r30'] * ring_vals[0],
-            s['r31'] * ring_vals[1],
-            s['r32'] * ring_vals[2],
-            s['r33'] * ring_vals[3],
-            # Thumb (joint_12..15) — cross channel v[0]↔v[1]
+            s['r31'] * ring_vals[1],    # j9  [-11..+92°]: MCP flex
+            s['r32'] * ring_vals[2],    # j10 [-10..+98°]: PIP flex
+            s['r33'] * ring_vals[3],    # j11 [-13..+93°]: DIP flex
+            # ── Thumb (joint_12..15) — cross-channel v[0]↔v[1] swap ──
+            # j12 [+40..+80°]: CMC-like, entirely POSITIVE range. Driven
+            # by val[1] (ThumbMCPStretch, CMC flex) with NEGATIVE scale
+            # (-4.375) and LARGE offset (o_t00 = 225° ≈ 90°×2.5 legacy).
+            # At rest (val[1]=0): angle = 225°; clips to upper 80°.
+            # More CMC flex → joint decreases toward lower 40°.
             s['t00'] * thumb_vals[1],
+            # j13 [+17..+67°]: base swing, entirely POSITIVE range.
+            # Driven by val[0] (ThumbMCPSpread, palmar abduction) with
+            # positive scale 6.0 and offset 0°. At rest val[0]=0 → 0° →
+            # clips to lower 17°; more abduction lifts the joint.
             s['t01'] * thumb_vals[0],
-            s['t02'] * thumb_vals[2],
-            s['t03'] * thumb_vals[3],
+            s['t02'] * thumb_vals[2],   # j14 [-11..+94°]: MCP flex (o_t02 = -30°)
+            s['t03'] * thumb_vals[3],   # j15 [-9..+98°]:  IP  flex
         ], dtype=float)
 
+        # Step 3 — additive per-joint offsets (deg). Sliders mutate
+        # self.offsets live. Thumb offsets are LARGE (o_t00 = 225°, etc.)
+        # because Allegro thumb joints have positive-biased ranges that
+        # don't include 0° — the offsets shift the rest pose into the
+        # valid joint range.
         o = self.offsets
         offset_deg = np.array([
             o['o_i10'], o['o_i11'], o['o_i12'], o['o_i13'],
@@ -301,9 +374,13 @@ class ManusAllegroSimNode(Node):
         ], dtype=float)
         angle_deg = angle_deg + offset_deg
 
+        # Steps 4-5 — deg → rad, clip to Allegro limits. The clip also
+        # discards glove-side hyperextension (Allegro flex joints stop
+        # around −11°..−13°), per ERGONOMICS.md §4 item 3.
         arr = np.deg2rad(angle_deg)
         arr = np.clip(arr, ALLEGRO_LOWER_LIMITS, ALLEGRO_UPPER_LIMITS)
 
+        # Step 6 — EMA smoothing.
         if self.prev_arr is None:
             smoothed = arr.copy()
         else:

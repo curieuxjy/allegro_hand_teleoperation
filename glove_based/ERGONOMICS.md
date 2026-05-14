@@ -23,6 +23,39 @@ ROS2 토픽 `manus_glove_#` → `ManusGlove.ergonomics[]` 배열
 
 > ⚠️ SDK 명명상 "Stretch"는 실제로 **flexion(굴곡)** 각도입니다. CSV exporter는 `*_Flex`로 표기하는 것과 같은 의미.
 
+## 2.5. IndexMCPSpread 누락 — Middle/Ring로 합성
+
+> ⚠️ Manus ROS2 publisher (`ManusDataPublisher.cpp`의 `ErgonomicsDataTypeToSide()`)에 버그가 있어 **`IndexMCPSpread` 채널이 publish되지 않음**. 한 손 ergonomics 배열에 20개가 아니라 **19개**의 entry만 도달한다.
+
+다른 spread 채널은 정상 publish되지만 type string 명명이 손가락마다 다름 — 파싱 시 두 형태 모두 처리해야 함:
+
+| Finger | Type string | 비고 |
+|---|---|---|
+| Thumb | `ThumbMCPSpread` | 유일하게 "MCP" prefix |
+| Index | **(없음)** | publisher 버그로 drop |
+| Middle / Ring / Pinky | `MiddleSpread` / `RingSpread` / `PinkySpread` | "MCP" 없음 |
+
+### 합성 전략 (이 repo의 retargeting 스크립트)
+
+Index 손가락은 hand-splay 시 middle + ring과 같은 방향으로 움직이므로, 누락된 IndexMCPSpread를 두 채널의 가중합으로 근사한다:
+
+```
+index_spread_joint = i_from_m × middle_spread_term + i_from_r × ring_spread_term
+```
+
+| 가중치 | 기본값 | 의미 |
+|---|---|---|
+| `i_from_m` | 0.5 | middle spread 기여도 |
+| `i_from_r` | 0.5 | ring spread 기여도 |
+
+- 두 값 모두 **tuning slider에서 실시간 조정** 가능 (sign-locked positive)
+- Default 0.5 / 0.5 → index가 middle/ring의 중간 방향으로 splay
+- 합성은 transform 함수의 **Step 2 (scale 항)** 위치에서 수행 — clip/EMA 이전에 일어나므로 index 자체의 offset(`o_i10`)이 그대로 적용됨
+- 음수 기여가 필요하면 transform 코드의 부호 자체를 직접 수정해야 함 (slider sign-lock 으로는 못 뒤집음)
+- 플랫폼별 합성식
+  - v6 / aph: `i_from_m × n('m20', middle[0]) + i_from_r × n('r30', ring[0])` (정규화된 항 합성)
+  - allegro: `i_from_m × s['m20'] × middle[0] + i_from_r × s['r30'] × ring[0]` (raw scale × glove deg 합성)
+
 ## 3. 부호 규약 (로봇 매핑용 핵심)
 
 ### Flex 계열 (`*Stretch`) — 모든 손가락 공통, 좌우 동일

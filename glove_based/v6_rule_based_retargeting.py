@@ -387,8 +387,10 @@ class ManusV6SimNode(Node):
             # normalized terms used below, mixed via tunable weights
             # `i_from_m` / `i_from_r` (default 0.5 / 0.5 — index sits
             # halfway between middle and ring during splay).
+            # (s['i_from_m'] * n('m20', middle_vals[0])
+            #  + s['i_from_r'] * n('r30', ring_vals[0])),
             (s['i_from_m'] * n('m20', middle_vals[0])
-             + s['i_from_r'] * n('r30', ring_vals[0])),
+             - s['i_from_r'] * n('r30', ring_vals[0])),
             n('i11', index_vals[1]),  # j11 [0..100°]: MCP flex
             n('i12', index_vals[2]),  # j12 [-5..90°]: PIP flex
             n('i13', index_vals[3]),  # j13 [-5..90°]: DIP flex
@@ -452,8 +454,8 @@ class ManusV6SimNode(Node):
         # link geometry, not a physiological constraint. When ring
         # abducts toward pinky (j30 negative), pinky flex must be at
         # least as negative or the links overlap.
-        if smoothed[17] > smoothed[12]:
-            smoothed[17] = smoothed[12]
+        # if smoothed[17] > smoothed[12]:
+        #     smoothed[17] = smoothed[12]
 
         self.prev_arr = smoothed
         return smoothed
